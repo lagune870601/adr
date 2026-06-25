@@ -1,0 +1,21 @@
+{
+  "name": "adsterra-cloakbrowser-puppeteer",
+  "version": "1.0.0",
+  "description": "Use CloakBrowser with Puppeteer to open adsterra.com",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "install:cn": "npm install --registry=https://registry.npmmirror.com",
+    "start": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node index.js",
+    "start:xvfb": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome xvfb-run -a node index.js",
+    "test": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test.js",
+    "verify": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node verify.js",
+    "advanced": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node advanced.js"
+  },
+  "dependencies": {
+    "cloakbrowser": "^0.3.31",
+    "mysql2": "^3.22.5",
+    "proxy-seller-user-api": "^1.9.0",
+    "puppeteer-core": "^24.0.0"
+  }
+}
