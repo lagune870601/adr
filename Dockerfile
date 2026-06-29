@@ -19,7 +19,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 
 # 安装项目依赖
-RUN npm ci --only=production
+RUN npm install --only=production
 
 # 复制源码
 COPY shared/     ./shared/
@@ -27,6 +27,7 @@ COPY lib/        ./lib/
 COPY proxy.js    ./
 COPY signup.js   ./
 COPY open-account.js ./
+COPY payout.js     ./
 COPY main.js     ./
 
 # 启动主调度器

@@ -2,6 +2,7 @@ import { getTask, updateTaskStatus, incrementRetryCount, getAccountByEmail } fro
 import { createProxy } from './shared/proxy-utils.js';
 import { signupCrawler } from './signup.js';
 import { accountCrawler } from './open-account.js';
+import { payoutCrawler } from './payout.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
@@ -10,6 +11,7 @@ const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
 const CRAWLER_DISPATCH = {
     'REGISTER': signupCrawler,
     'ACCOUNT': accountCrawler,
+    'PAYOUT': payoutCrawler,
 };
 
 /**
