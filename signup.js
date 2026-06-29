@@ -1,20 +1,15 @@
 import { launch } from 'cloakbrowser/puppeteer';
 import os from 'os';
 import mysql from 'mysql2/promise';
+import { DB_CONFIG } from './shared/db.js';
 import { ResidentProxyManager } from './proxy.js';
+
+const PROXY_API_KEY = '629a2e2ce2532c8c4ad034fbc4f3c8a5';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const isLinux = os.platform() === 'linux';
 
-const PROXY_API_KEY = '629a2e2ce2532c8c4ad034fbc4f3c8a5';
-
-const DB_CONFIG = {
-    host: '166.0.19.103',
-    port: 13307,
-    user: 'root',
-    password: 'root',
-    database: 'ad',
-};
+// DB_CONFIG 从 shared/db.js 导入，用于爬虫自身的业务表操作（adsterra_account 等）
 
 // Messenger 账号格式映射
 const MESSENGER_FORMATS = {
@@ -40,78 +35,6 @@ function generateRandomAccount(format) {
         case 'instagram': return `@${randomStr()}`;
         case 'twitter':   return `@${randomStr()}`;
         default:          return randomStr();
-    }
-}
-
-/**
- * 从 crawler_task 表中查询一条待注册的任务
- * 条件: task_type=REGISTER, task_status IN ('pending','retry'), scheduled_time <= 北京时间, is_delete=0, retry_count < 5
- * 按 scheduled_time 升序（最接近当前时间的排最前），取一条
- */
-async function getRegisterTask() {
-    console.log('🔍 查询待注册任务...');
-    const connection = await mysql.createConnection(DB_CONFIG);
-
-    try {
-        // scheduled_time 按北京时间录入，使用北京时间进行比较
-        const nowBeijing = new Date(new Date().getTime() + 8 * 60 * 60 * 1000)
-            .toISOString().slice(0, 19).replace('T', ' ');
-        const [rows] = await connection.execute(
-            `SELECT id, username, email, retry_count, scheduled_time
-             FROM crawler_task
-             WHERE task_type = 'REGISTER'
-               AND task_status IN ('pending', 'retry')
-               AND scheduled_time <= ?
-               AND is_delete = 0
-               AND retry_count < 5
-             ORDER BY scheduled_time ASC
-             LIMIT 1`,
-            [nowBeijing]
-        );
-
-        if (rows.length === 0) {
-            console.warn('⚠️  没有待注册的任务');
-            return null;
-        }
-
-        const task = rows[0];
-        console.log(`✅ 找到任务: id=${task.id}, username="${task.username}", email="${task.email}"`);
-        console.log(`   retry_count=${task.retry_count}, scheduled_time=${task.scheduled_time}`);
-        return task;
-    } finally {
-        await connection.end();
-    }
-}
-
-/**
- * 更新 crawler_task 状态
- */
-async function updateTaskStatus(taskId, status) {
-    const connection = await mysql.createConnection(DB_CONFIG);
-    try {
-        await connection.execute(
-            'UPDATE crawler_task SET task_status = ? WHERE id = ?',
-            [status, taskId]
-        );
-        console.log(`   💾 任务状态已更新: id=${taskId}, status=${status}`);
-    } finally {
-        await connection.end();
-    }
-}
-
-/**
- * 递增 crawler_task 的 retry_count
- */
-async function incrementRetryCount(taskId) {
-    const connection = await mysql.createConnection(DB_CONFIG);
-    try {
-        await connection.execute(
-            'UPDATE crawler_task SET retry_count = retry_count + 1, last_retry_time = NOW() WHERE id = ?',
-            [taskId]
-        );
-        console.log(`   💾 retry_count +1 (task id=${taskId})`);
-    } finally {
-        await connection.end();
     }
 }
 
@@ -355,23 +278,14 @@ async function waitForCloudflareChallenge(page, maxWaitMs = 60000) {
     return 'timeout';
 }
 
-async function signupCrawler() {
+export async function signupCrawler(task, proxy) {
     console.log('🚀 启动 CloakBrowser (Sign Up 爬虫)...\n');
 
-    // 从数据库查询待注册任务
-    const task = await getRegisterTask();
-    if (!task) {
-        console.error('❌ 没有待注册的任务，退出');
-        process.exit(1);
-    }
-
-    // 更新任务状态为 processing
-    await updateTaskStatus(task.id, 'processing');
+    console.log(`👤 姓名: ${task.username}`);
+    console.log(`📧 邮箱: ${task.email}`);
 
     // 以 username 为基准生成登录名称
     const loginName = task.username.replace(/\s+/g, '').toLowerCase() + Math.random().toString(36).substring(2, 6);
-    console.log(`👤 姓名: ${task.username}`);
-    console.log(`📧 邮箱: ${task.email}`);
     console.log(`🔑 登录名: ${loginName}\n`);
 
     // 预 SIGN UP 阶段重试循环（最多 5 次）
@@ -381,39 +295,15 @@ async function signupCrawler() {
     for (let attempt = 0; attempt < MAX_RETRIES && !signupClicked; attempt++) {
         if (attempt > 0) {
             console.log(`\n🔄 第 ${attempt + 1}/${MAX_RETRIES} 次重试...`);
-            await updateTaskStatus(task.id, 'retry');
-            await incrementRetryCount(task.id);
         }
 
     let browser;
-    let proxyManager;
+    let proxyManager;  // 用于 confirm link 阶段的代理
 
     try {
         const platform = os.platform();
         console.log(`🖥️  当前平台: ${platform} (${isLinux ? '无头模式' : '窗口模式'})`);
-
-        // 获取代理
-        console.log('🔌 获取代理...');
-        proxyManager = new ResidentProxyManager({
-            apiKey: PROXY_API_KEY,
-            country: 'US',
-            rotationInterval: 30 * 60 * 1000,
-            protocol: 'http',
-            verbose: true,
-        });
-
-        proxyManager.on('proxy:ready', (proxy) => {
-            console.log(`   ✅ 代理就绪: ${proxy.host}:${proxy.port}`);
-        });
-
-        proxyManager.on('error', ({ error }) => {
-            console.warn(`   ⚠️  代理错误: ${error.message}`);
-        });
-
-        await proxyManager.start();
-        const proxy = await proxyManager.getProxy();
-        console.log(`   📡 代理地址: ${proxy.host}:${proxy.port}`);
-        console.log(`   👤 代理账号: ${proxy.username}`);
+        console.log(`   📡 代理: ${proxy.host}:${proxy.port}`);
 
         // 启动 CloakBrowser - Linux 使用无头模式，Windows 使用窗口模式
         browser = await launch({
@@ -1140,9 +1030,6 @@ async function signupCrawler() {
                             // 关闭当前浏览器
                             console.log('   🔒 关闭当前浏览器...');
                             await browser.close();
-                            if (proxyManager) {
-                                proxyManager.destroy();
-                            }
 
                             // 启动新浏览器，不挂代理
                             console.log('   🌐 启动新浏览器（无代理）...');
@@ -1264,9 +1151,8 @@ async function signupCrawler() {
                             if (!inputFound) {
                                 console.warn('   ⚠️  未找到邮箱输入框');
                                 await yopmailPage.screenshot({ path: 'step13-yopmail-input-failed.png', fullPage: true });
-                                console.log('\n🕐 yopmail 浏览器保持打开状态，按 Ctrl+C 退出...');
-                                await new Promise(() => {});
-                                return;
+                                await browser.close();
+                                return { success: false, retryable: false, error: '未找到 yopmail 邮箱输入框' };
                             } else {
                                 // 等待邮箱加载
                                 await sleep(5000);
@@ -1719,11 +1605,7 @@ async function signupCrawler() {
                                                         console.warn(`   ⚠️  更新 adsterra_account 失败: ${e.message}`);
                                                     }
 
-                                                    // 更新任务状态为 completed
-                                                    console.log('   💾 更新任务状态为 completed...');
-                                                    await updateTaskStatus(task.id, 'completed');
-                                                    console.log('   ✅ 任务已完成！');
-                                                } else {
+                                                    } else {
                                                     console.log('   ⚠️  可能仍在登录页，请手动确认');
                                                 }
 
@@ -1735,28 +1617,28 @@ async function signupCrawler() {
                                             }
                                         }
 
-                                        // 步骤 16-17 完成，保持浏览器打开
+                                        // 步骤 16-17 完成，关闭浏览器并返回
                                         console.log('\n========================================\n');
                                         console.log('✅ Sign Up 爬虫 + 邮件确认 + 登录 完成！');
-                                        console.log('\n🕐 浏览器保持打开状态，按 Ctrl+C 退出...');
-                                        await new Promise(() => {});
-                                        return;
+                                        await browser.close();
+                                        return { success: true };
                                     } else {
                                         console.warn('   ⚠️  未找到 Confirm email 链接');
                                         if (confirmLink) {
                                             console.log(`   诊断: iframe linkCount=${confirmLink.linkCount}, body="${confirmLink.bodyPreview?.slice(0, 200)}"`);
                                         }
                                         await yopmailPage.screenshot({ path: 'step15-confirm-link-not-found.png', fullPage: true });
+                                        await browser.close();
+                                        return { success: false, retryable: false, error: '未找到 Confirm email 链接' };
                                     }
                                 } else {
                                     console.warn('   ⚠️  未找到 Adsterra 确认邮件');
 
-                                    // yopmail 流程未完成，保持浏览器打开
+                                    // yopmail 流程未完成，关闭浏览器并返回
                                     console.log('\n========================================\n');
-                                    console.log('⚠️  未找到确认邮件，yopmail 浏览器保持打开');
-                                    console.log('\n🕐 按 Ctrl+C 退出...');
-                                    await new Promise(() => {});
-                                    return;
+                                    console.log('⚠️  未找到确认邮件');
+                                    await browser.close();
+                                    return { success: false, retryable: false, error: '未找到确认邮件' };
                                 }
                             }
                         } else {
@@ -1797,11 +1679,8 @@ async function signupCrawler() {
                     console.log('\n========================================\n');
                     console.log('✅ Sign Up 爬虫执行完成！');
                     console.log(`🔗 最终页面地址：${targetUrl}`);
-                    console.log('\n🕐 浏览器保持打开状态，按 Ctrl+C 退出...');
-
-                    // 保持进程运行
-                    await new Promise(() => {});
-                    return;
+                    await browser.close();
+                    return { success: true };
 
                 } catch (e) {
                     console.log('⚠️ 获取新标签页详情失败:', e.message);
@@ -1826,10 +1705,8 @@ async function signupCrawler() {
         console.log('\n========================================\n');
         console.log('✅ Sign Up 爬虫执行完成！');
         console.log(`🔗 最终页面地址：${finalUrl}`);
-        console.log('\n🕐 浏览器保持打开状态，按 Ctrl+C 退出...');
-
-        // 保持进程运行
-        await new Promise(() => {});
+        await browser.close();
+        return { success: true };
 
     } catch (error) {
         console.error('❌ 发生错误:', error.message);
@@ -1839,10 +1716,6 @@ async function signupCrawler() {
             try { await browser.close(); } catch (_) {}
             browser = null;
         }
-        if (proxyManager) {
-            proxyManager.destroy();
-            proxyManager = null;
-        }
 
         if (!signupClicked) {
             // SIGN UP 之前失败 → 重试
@@ -1850,15 +1723,13 @@ async function signupCrawler() {
                 console.log(`   🔄 将在下次循环中重试...\n`);
                 continue;
             }
-            // 重试次数用完 → 标记 failed
-            console.error('❌ 重试次数已用完，任务标记为 failed');
-            await updateTaskStatus(task.id, 'failed');
-            process.exit(1);
+            // 重试次数用完
+            console.error('❌ 重试次数已用完');
+            return { success: false, retryable: true, error: error.message };
         } else {
-            // SIGN UP 之后失败 → 直接标记 failed
-            console.error('❌ SIGN UP 后流程异常，任务标记为 failed');
-            await updateTaskStatus(task.id, 'failed');
-            process.exit(1);
+            // SIGN UP 之后失败 → 不可重试
+            console.error('❌ SIGN UP 后流程异常');
+            return { success: false, retryable: false, error: error.message };
         }
     }
 
@@ -1866,19 +1737,7 @@ async function signupCrawler() {
 
     // 如果 for 循环结束但 signupClicked 仍为 false（重试耗尽）
     if (!signupClicked) {
-        console.error('❌ 未能成功提交 SIGN UP，退出');
-        process.exit(1);
+        console.error('❌ 未能成功提交 SIGN UP');
+        return { success: false, retryable: true, error: '重试耗尽，未能成功提交 SIGN UP' };
     }
 }
-
-// 处理进程退出
-process.on('SIGINT', async () => {
-    console.log('\n👋 正在关闭浏览器...');
-    process.exit(0);
-});
-
-// 启动爬虫
-signupCrawler().catch((error) => {
-    console.error('❌ 未捕获的错误:', error);
-    process.exit(1);
-});
