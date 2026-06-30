@@ -22,8 +22,8 @@ export async function getTask(taskTypes) {
     const connection = await mysql.createConnection(DB_CONFIG);
 
     try {
-        // scheduled_time 存储的是 US Pacific Time
-        const nowPt = new Date().toLocaleString('sv-SE', { timeZone: 'America/Los_Angeles' })
+        // scheduled_time 存储的是 US Eastern Time
+        const nowPt = new Date().toLocaleString('sv-SE', { timeZone: 'America/New_York' })
             .replace(' ', 'T').substring(0, 19);
         const placeholders = taskTypes.map(() => '?').join(',');
         const sql = `SELECT id, username, email, retry_count, scheduled_time, task_type
