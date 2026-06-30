@@ -26,6 +26,15 @@ export async function getTask(taskTypes) {
         const nowPt = new Date().toLocaleString('sv-SE', { timeZone: 'America/Los_Angeles' })
             .replace(' ', 'T').substring(0, 19);
         const placeholders = taskTypes.map(() => '?').join(',');
+        const sql = `SELECT id, username, email, retry_count, scheduled_time, task_type
+             FROM crawler_task
+             WHERE task_type IN (${placeholders})
+               AND task_status IN ('pending', 'retry')
+               AND scheduled_time <= ?
+               AND is_delete = 0
+               AND retry_count < 5
+             ORDER BY scheduled_time ASC
+             LIMIT 1`;
         const [rows] = await connection.execute(
             `SELECT id, username, email, retry_count, scheduled_time, task_type
              FROM crawler_task

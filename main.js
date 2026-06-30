@@ -1,7 +1,7 @@
 import { getTask, updateTaskStatus, incrementRetryCount, getAccountByEmail } from './shared/db.js';
 import { createProxy } from './shared/proxy-utils.js';
 import { signupCrawler } from './signup.js';
-import { accountCrawler } from './open-account.js';
+// import { accountCrawler } from './open-account.js';
 import { payoutCrawler } from './payout.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -10,8 +10,8 @@ const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
 // 任务类型 → 爬虫函数映射
 const CRAWLER_DISPATCH = {
     'REGISTER': signupCrawler,
-    'ACCOUNT': accountCrawler,
-    'PAYOUT': payoutCrawler,
+    // 'ACCOUNT': accountCrawler,
+    // 'PAYOUT': payoutCrawler,
 };
 
 /**
