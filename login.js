@@ -525,7 +525,7 @@ async function updateAccountInDb(email, loginIp, cookiesJson) {
     const connection = await mysql.createConnection(DB_CONFIG);
     try {
         await connection.execute(
-            `UPDATE adsterra_account SET login_ip = ?, cookie = ? WHERE account = ?`,
+            `UPDATE adsterra_account SET status = 'LOGIN_SUCCESS', login_ip = ?, cookie = ? WHERE account = ?`,
             [loginIp || '', cookiesJson, email]
         );
         console.log('   ✅ 数据库更新成功');
