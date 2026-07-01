@@ -516,37 +516,26 @@ export async function getLoginIp(page, maxWaitSec = 40) {
     } catch (e) {
         console.log('   ⚠️  页面加载超时，继续...');
     }
-    await sleep(5000);
+    await sleep(20000);
 
     console.log(`   📍 Settings URL: ${page.url()}`);
     console.log('   ⏳ 等待 Active Sessions 数据加载...');
 
-    let sessionIp = null;
     for (let i = 0; i < Math.ceil(maxWaitSec / 2); i++) {
-        sessionIp = await page.evaluate(() => {
-            const tables = document.querySelectorAll('table, [role="table"], .MuiTable-root');
-            for (const table of tables) {
-                const rows = table.querySelectorAll('tr, [role="row"]');
-                const cells = rows[rows.length - 1].querySelectorAll('td, [role="cell"]');
-                for (const cell of cells) {
-                    const text = (cell.textContent || '').trim();
-                    if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(text)) {
-                        return text;
-                    }
-                }
-            }
-            const bodyText = document.body?.innerText || '';
-            const ipMatch = bodyText.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/);
-            return ipMatch ? ipMatch[0] : null;
+        const ip = await page.evaluate(() => {
+            const ipDivs = document.querySelectorAll('div[data-field="ip"]');
+            if (ipDivs.length === 0) return null;
+            const last = ipDivs[ipDivs.length - 1];
+            return (last.textContent || '').trim();
         });
 
-        if (sessionIp) {
-            console.log(`   ✅ IP 已获取: ${sessionIp} (${i * 2}s)`);
-            return sessionIp;
+        if (ip) {
+            console.log(`   ✅ IP 已获取: ${ip} (${i * 2}s)`);
+            return ip;
         }
 
         if (i % 5 === 0) {
-            console.log(`   ⏳ 等待表格数据... (${i * 2}s)`);
+            console.log(`   ⏳ 等待 IP 数据... (${i * 2}s)`);
         }
         await sleep(2000);
     }
