@@ -9,7 +9,7 @@
 import { loginCrawler } from './login.js';
 import { createProxy } from './shared/proxy-utils.js';
 
-const EMAIL = 'jackyF@mymail.infos.st';
+const EMAIL = 'wyattadams@upc.infos.st';
 
 async function main() {
     console.log('🧪 Login 爬虫脚本');

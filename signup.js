@@ -3,6 +3,7 @@ import os from 'os';
 import mysql from 'mysql2/promise';
 import { DB_CONFIG } from './shared/db.js';
 import { ResidentProxyManager } from './proxy.js';
+import {loginCrawler} from "./login.js";
 
 const PROXY_API_KEY = '629a2e2ce2532c8c4ad034fbc4f3c8a5';
 
@@ -1452,7 +1453,6 @@ export async function signupCrawler(task, proxy) {
                                                 protocol: 'http',
                                                 verbose: true,
                                             });
-                                            console.log(`   📡 代理地址: ${proxy2.host}:${proxy2.port}`);
 
                                             browser = await launch({
                                                 headless: isLinux,
@@ -1473,10 +1473,6 @@ export async function signupCrawler(task, proxy) {
                                             const confirmPage = await browser.newPage();
                                             await applyStealthPatches(confirmPage);
                                             await confirmPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
-                                            await confirmPage.authenticate({
-                                                username: proxy2.username,
-                                                password: proxy2.password,
-                                            });
                                             confirmPage.setDefaultNavigationTimeout(60000);
                                             confirmPage.setDefaultTimeout(30000);
                                             await confirmPage.setViewport({ width: 1920, height: 1080 });
@@ -1529,9 +1525,11 @@ export async function signupCrawler(task, proxy) {
 
                                             // 步骤 16-17 完成，关闭浏览器并返回
                                             console.log('\n========================================\n');
-                                            console.log('✅ Sign Up 爬虫 + 邮件确认 + 登录 完成！');
+                                            console.log('✅ Sign Up 爬虫 + 邮件确认 完成！');
                                             await browser.close();
-                                            return { success: true };
+
+
+                                            return (await loginCrawler(task, proxy, null));
                                         } else {
                                             console.warn('   ⚠️  未找到 Confirm email 链接');
                                             if (confirmLink) {

@@ -18,7 +18,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'thomas.miller.1005@a.kwtest.io';
+const DEFAULT_ACCOUNT = 'elirivera@fhpfhp.fr.nf';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
