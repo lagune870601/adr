@@ -9,12 +9,12 @@
 import { loginCrawler } from './login.js';
 import { createProxy } from './shared/proxy-utils.js';
 
-const EMAIL = 'isaacnguyenig@mabal.fr.nf';
+const EMAIL = 'jackyF@mymail.infos.st';
 
 async function main() {
-    console.log('🧪 Login 爬虫自测脚本');
+    console.log('🧪 Login 爬虫脚本');
     console.log('========================================');
-    console.log(`📧 测试邮箱: ${TEST_EMAIL}\n`);
+    console.log(`📧 邮箱: ${EMAIL}\n`);
 
     // 1. 构建 mock task
     const task = {

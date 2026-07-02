@@ -22,14 +22,22 @@ async function mainLoop() {
     console.log('🚀 启动主调度器...\n');
 
     while (true) {
-        const task = await getTask(Object.keys(CRAWLER_DISPATCH));
-        if (!task) {
-            console.log(`⏳ 暂无待处理任务，${POLL_INTERVAL / 1000}s 后重试...\n`);
-            await sleep(POLL_INTERVAL);
-            continue;
+        try {
+            const task = await getTask(Object.keys(CRAWLER_DISPATCH));
+            if (!task) {
+                console.log(`⏳ 暂无待处理任务，${POLL_INTERVAL / 1000}s 后重试...\n`);
+                await sleep(POLL_INTERVAL);
+                continue;
+            }
+
+            await executeTask(task);
+        } catch (e) {
+            console.error('💥 主调度器异常:', e.message);
+            if (e.stack) console.error(e.stack);
+            console.log(`⏳ ${POLL_INTERVAL * 10/ 1000}s 后重试...\n`);
+            await sleep(POLL_INTERVAL * 10);
         }
 
-        await executeTask(task);
     }
 }
 
