@@ -13,6 +13,7 @@ export async function createProxy(options = {}) {
     const manager = new ResidentProxyManager({
         apiKey: PROXY_API_KEY,
         country: 'US',
+        listId:20858948,
         rotationInterval: 30 * 60 * 1000,
         protocol: 'http',
         verbose: true,

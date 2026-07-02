@@ -105,11 +105,18 @@ export async function payoutCrawler(task, proxy, cookies) {
         // 1. 启动浏览器
         browser = await launch({
             headless: true,
+            proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+            humanize: true,
+            timezone: 'America/New_York',
+            locale: 'en-US',
+            viewport: { width: 1920, height: 1080 },
             args: [
-                '--no-sandbox', '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', '--disable-gpu',
-                `--proxy-server=${proxy.host}:${proxy.port}`,
-            ],
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+            ]
         });
         const page = await browser.newPage();
         await page.authenticate({ username: proxy.username, password: proxy.password });

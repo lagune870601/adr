@@ -18,7 +18,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'isaacnguyenig@mabal.fr.nf';
+const DEFAULT_ACCOUNT = 'thomas.miller.1005@a.kwtest.io';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
@@ -169,13 +169,17 @@ async function accountCrawler() {
         console.log('\n🌐 步骤 3: 启动 CloakBrowser...');
         browser = await launch({
             headless: isLinux,
+            proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+            humanize: true,
+            timezone: 'America/New_York',
+            locale: 'en-US',
+            viewport: { width: 1920, height: 1080 },
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas',
                 '--disable-gpu',
-                `--proxy-server=${proxy.host}:${proxy.port}`,
             ]
         });
 

@@ -58,7 +58,18 @@ async function main() {
         // 3. Launch browser
         browser = await launch({
             headless: isLinux,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', `--proxy-server=${proxy.host}:${proxy.port}`],
+            proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+            humanize: true,
+            timezone: 'America/New_York',
+            locale: 'en-US',
+            viewport: { width: 1920, height: 1080 },
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+            ]
         });
         const page = await browser.newPage();
         await page.authenticate({ username: proxy.username, password: proxy.password });

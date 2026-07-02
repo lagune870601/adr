@@ -564,15 +564,17 @@ export async function loginCrawler(task, proxy, _cookies = null) {
             // 启动 CloakBrowser
             browser = await launch({
                 headless: isLinux,
+                proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+                humanize: true,
+                timezone: 'America/New_York',
+                locale: 'en-US',
+                viewport: { width: 1920, height: 1080 },
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-accelerated-2d-canvas',
                     '--disable-gpu',
-                    '--window-size=1920,1080',
-                    '--disable-blink-features=AutomationControlled',
-                    `--proxy-server=${proxy.host}:${proxy.port}`,
                 ]
             });
 

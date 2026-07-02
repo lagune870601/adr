@@ -480,15 +480,17 @@ export async function signupCrawler(task, proxy) {
             // 启动 CloakBrowser - Linux 使用无头模式，Windows 使用窗口模式
             browser = await launch({
                 headless: isLinux,
+                proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+                humanize: true,
+                timezone: 'America/New_York',
+                locale: 'en-US',
+                viewport: { width: 1920, height: 1080 },
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-accelerated-2d-canvas',
                     '--disable-gpu',
-                    '--window-size=1920,1080',
-                    '--disable-blink-features=AutomationControlled',
-                    `--proxy-server=${proxy.host}:${proxy.port}`,
                 ]
             });
 
@@ -1218,14 +1220,16 @@ export async function signupCrawler(task, proxy) {
                                 console.log('   🌐 启动新浏览器（无代理）...');
                                 browser = await launch({
                                     headless: isLinux,
+                                    humanize: true,
+                                    timezone: 'America/New_York',
+                                    locale: 'en-US',
+                                    viewport: { width: 1920, height: 1080 },
                                     args: [
                                         '--no-sandbox',
                                         '--disable-setuid-sandbox',
                                         '--disable-dev-shm-usage',
                                         '--disable-accelerated-2d-canvas',
                                         '--disable-gpu',
-                                        '--window-size=1920,1080',
-                                        '--disable-blink-features=AutomationControlled',
                                     ]
                                 });
 
@@ -1448,21 +1452,21 @@ export async function signupCrawler(task, proxy) {
                                                 protocol: 'http',
                                                 verbose: true,
                                             });
-                                            await proxyManager.start();
-                                            const proxy2 = await proxyManager.getProxy();
                                             console.log(`   📡 代理地址: ${proxy2.host}:${proxy2.port}`);
 
                                             browser = await launch({
                                                 headless: isLinux,
+                                                proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+                                                humanize: true,
+                                                timezone: 'America/New_York',
+                                                locale: 'en-US',
+                                                viewport: { width: 1920, height: 1080 },
                                                 args: [
                                                     '--no-sandbox',
                                                     '--disable-setuid-sandbox',
                                                     '--disable-dev-shm-usage',
                                                     '--disable-accelerated-2d-canvas',
                                                     '--disable-gpu',
-                                                    '--window-size=1920,1080',
-                                                    '--disable-blink-features=AutomationControlled',
-                                                    `--proxy-server=${proxy2.host}:${proxy2.port}`,
                                                 ]
                                             });
 
