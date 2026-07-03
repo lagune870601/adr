@@ -1,8 +1,11 @@
 import { getTask, updateTaskStatus, incrementRetryCount, getAccountByEmail } from './shared/db.js';
 import { createProxy } from './shared/proxy-utils.js';
 import { signupCrawler } from './signup.js';
+import mysql from 'mysql2/promise';
+import { DB_CONFIG } from './shared/db.js';
 // import { accountCrawler } from './open-account.js';
 import { payoutCrawler } from './payout.js';
+import { createApiTokenCrawler } from './create-api-token.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
@@ -12,6 +15,7 @@ const CRAWLER_DISPATCH = {
     'REGISTER': signupCrawler,
     // 'ACCOUNT': accountCrawler,
     // 'PAYOUT': payoutCrawler,
+    'CREATE_API_TOKEN': createApiTokenCrawler,
 };
 
 /**
@@ -86,6 +90,11 @@ async function executeTask(task) {
         console.log(`\n========== 任务 #${task.id} 结果 ==========`);
         if (result.success) {
             console.log('✅ 任务执行成功');
+            if (result.apiToken) {
+                console.log(`   🔑 API Token: ${result.apiToken.slice(0, 10)}...${result.apiToken.slice(-4)}`);
+                // 兜底保存 apiToken 到 crawler_task.result（爬虫内部已保存，此处确保一致性）
+                await saveTaskResult(task.id, result.apiToken);
+            }
             await updateTaskStatus(task.id, 'completed');
         } else if (result.retryable) {
             console.log(`🔄 任务需重试: ${result.error}`);
@@ -111,6 +120,24 @@ process.on('SIGINT', () => {
     console.log('\n\n👋 正在关闭主调度器...');
     process.exit(0);
 });
+
+/**
+ * 兜底保存 apiToken 到 crawler_task.result 字段
+ */
+async function saveTaskResult(taskId, apiToken) {
+    const connection = await mysql.createConnection(DB_CONFIG);
+    try {
+        await connection.execute(
+            'UPDATE crawler_task SET result = ? WHERE id = ?',
+            [apiToken, taskId]
+        );
+        console.log(`   💾 crawler_task.result 已保存 (task_id=${taskId})`);
+    } catch (err) {
+        console.error('   ⚠️  保存 result 失败:', err.message);
+    } finally {
+        await connection.end();
+    }
+}
 
 // 启动
 mainLoop().catch((error) => {
