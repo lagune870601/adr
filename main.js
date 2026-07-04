@@ -7,6 +7,7 @@ import { loginCrawler } from './login.js';
 // import { accountCrawler } from './open-account.js';
 import { payoutCrawler } from './payout.js';
 import { createApiTokenCrawler } from './create-api-token.js';
+import { createLinkCrawler } from './create-link.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
@@ -17,7 +18,8 @@ const CRAWLER_DISPATCH = {
     'LOGIN': loginCrawler,
     // 'ACCOUNT': accountCrawler,
     // 'PAYOUT': payoutCrawler,
-    //'CREATE_API_TOKEN': createApiTokenCrawler,
+    'CREATE_API_TOKEN': createApiTokenCrawler,
+    'CREATE_LINK': createLinkCrawler,
 };
 
 /**
