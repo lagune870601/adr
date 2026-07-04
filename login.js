@@ -543,10 +543,6 @@ export async function loginCrawler(task, proxy, _cookies = null) {
     console.log(`👤 姓名: ${task.username}`);
     console.log(`📧 邮箱: ${task.email}`);
 
-    // 以 username 为基准生成登录名称
-    const loginName = task.username.replace(/\s+/g, '').toLowerCase() + Math.random().toString(36).substring(2, 6);
-    console.log(`🔑 登录名: ${loginName}\n`);
-
     const MAX_RETRIES = 5;
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -683,6 +679,7 @@ export async function loginCrawler(task, proxy, _cookies = null) {
                 console.log('🎉 Cloudflare 挑战成功！登录表单已加载。');
             } else if (cfBeforeForm === 'failed') {
                 console.log('💀 Cloudflare 挑战失败！页面被拦截，无法继续。');
+                await browser.close();
                 return { success: false, retryable: false, error: 'Cloudflare 挑战失败，页面被拦截' };
             } else {
                 console.log('⚠️  Cloudflare 挑战超时，继续尝试填写表单...');
@@ -755,6 +752,7 @@ export async function loginCrawler(task, proxy, _cookies = null) {
             if (loginIp) console.log(`🌐 登录 IP: ${loginIp}`);
             console.log('========================================\n');
 
+            await browser.close();
             return { success: loginSuccess, url: finalUrl, loginIp };
 
         } catch (error) {

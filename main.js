@@ -3,6 +3,7 @@ import { createProxy } from './shared/proxy-utils.js';
 import { signupCrawler } from './signup.js';
 import mysql from 'mysql2/promise';
 import { DB_CONFIG } from './shared/db.js';
+import { loginCrawler } from './login.js';
 // import { accountCrawler } from './open-account.js';
 import { payoutCrawler } from './payout.js';
 import { createApiTokenCrawler } from './create-api-token.js';
@@ -13,9 +14,10 @@ const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
 // 任务类型 → 爬虫函数映射
 const CRAWLER_DISPATCH = {
     'REGISTER': signupCrawler,
+    'LOGIN': loginCrawler,
     // 'ACCOUNT': accountCrawler,
     // 'PAYOUT': payoutCrawler,
-    'CREATE_API_TOKEN': createApiTokenCrawler,
+    //'CREATE_API_TOKEN': createApiTokenCrawler,
 };
 
 /**
@@ -70,9 +72,9 @@ async function executeTask(task) {
             throw new Error(`未知任务类型: ${task.task_type}`);
         }
 
-        // 3. 非 REGISTER 任务：从 adsterra_account 获取 cookies
+        // 3. 非 REGISTER/LOGIN 任务：从 adsterra_account 获取 cookies
         let cookies = null;
-        if (task.task_type !== 'REGISTER') {
+        if (task.task_type !== 'REGISTER' && task.task_type !== 'LOGIN') {
             console.log('\n📦 查询账号 cookies...');
             const accountData = await getAccountByEmail(task.email);
             if (!accountData) {
