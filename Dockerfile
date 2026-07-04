@@ -27,7 +27,11 @@ COPY lib/        ./lib/
 COPY proxy.js    ./
 COPY signup.js   ./
 COPY open-account.js ./
+COPY login.js ./
 COPY create-api-token.js ./
+COPY change-name.js ./
+COPY create-link.js ./
+COPY create-payout.js ./
 COPY payout.js     ./
 COPY main.js     ./
 
