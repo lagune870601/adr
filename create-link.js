@@ -124,8 +124,13 @@ export async function createLinkCrawler(task, proxy, cookies) {
             console.log(`   当前 link 总数: ${totalCount}`);
         }
 
-        if (totalCount < 10 && createAttempts >= MAX_CREATE_RETRIES) {
-            console.log(`\n⚠️  重试耗尽 (${createAttempts}/${MAX_CREATE_RETRIES})，当前总数: ${totalCount}`);
+        if (totalCount < 10) {
+            const errMsg = totalCount < 10 && createAttempts >= MAX_CREATE_RETRIES
+                ? `重试耗尽 (${createAttempts}/${MAX_CREATE_RETRIES})，当前 link 总数: ${totalCount}`
+                : `link 总数不足 (${totalCount}/10)`;
+            console.log(`\n❌ ${errMsg}`);
+            await browser.close();
+            return { success: false, retryable: true, error: errMsg };
         }
 
         // 5. 获取所有 link 的名称和值，保存到数据库
