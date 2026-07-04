@@ -41,7 +41,7 @@ export async function createPayoutCrawler(task, proxy, cookies) {
     let browser;
     try {
         browser = await launch({
-            headless: true,
+            headless: isLinux,
             proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
             humanize: true,
             timezone: 'America/New_York',
