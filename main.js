@@ -10,6 +10,7 @@ import { createApiTokenCrawler } from './create-api-token.js';
 import { createLinkCrawler } from './create-link.js';
 import { createPayoutCrawler } from './create-payout.js';
 import { changeNameCrawler } from './change-name.js';
+import { updateUsdtAddressCrawler } from './update-usdt-address.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
@@ -24,6 +25,7 @@ const CRAWLER_DISPATCH = {
     'CREATE_LINK': createLinkCrawler,
     'CREATE_PAYOUT': createPayoutCrawler,
     'CHANGE_NAME': changeNameCrawler,
+    'UPDATE_USDT_ADDRESS': updateUsdtAddressCrawler,
 };
 
 /**
