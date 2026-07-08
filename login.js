@@ -507,6 +507,562 @@ async function submitLoginForm(page) {
 }
 
 /**
+ * 检测页面是否显示密码重置提示（安全策略更新导致密码被重置）
+ */
+async function checkPasswordResetMessage(page) {
+    // 先尝试查找 toast/alert 中的错误信息（更精确）
+    const toastResult = await page.evaluate(() => {
+        const toastEl = document.querySelector(
+            '[class*="toast" i], [class*="alert" i], [class*="message" i], ' +
+            '[class*="notification" i], [role="alert"], ' +
+            '[class*="error" i], [class*="warning" i], ' +
+            '.MuiAlert-root, .MuiSnackbar-root, [class*="snackbar" i]'
+        );
+        if (toastEl) {
+            const text = (toastEl.textContent || '').toLowerCase();
+            return {
+                found: text.includes('password was reset') || text.includes('security update') ||
+                       text.includes('password') && text.includes('reset') && text.includes('email'),
+                text: text.slice(0, 300),
+                source: 'toast',
+            };
+        }
+        return { found: false, source: 'no_toast' };
+    });
+
+    if (toastResult.found) {
+        console.log('   🔄 Toast 检测到密码重置提示:', toastResult.text.slice(0, 200));
+        return true;
+    }
+
+    // 降级：全文搜索
+    const result = await page.evaluate(() => {
+        const bodyText = (document.body?.innerText || '').toLowerCase();
+        return {
+            hasResetMessage: bodyText.includes('your password was reset') ||
+                             bodyText.includes('password was reset') ||
+                             bodyText.includes('security update') ||
+                             (bodyText.includes('password') && bodyText.includes('reset') && bodyText.includes('email')),
+            bodyPreview: bodyText.slice(0, 500),
+        };
+    });
+    if (result.hasResetMessage) {
+        console.log('   🔄 全文检测到密码重置提示:', result.bodyPreview.slice(0, 200));
+    }
+    return result.hasResetMessage;
+}
+
+/**
+ * 处理密码重置流程：yopmail → 获取 restore 链接 → 设置新密码 → 重新登录
+ *
+ * 流程：
+ *   1. 关闭当前代理浏览器
+ *   2. 启动无代理浏览器访问 yopmail，获取重置密码邮件中的 restore 链接
+ *   3. 关闭 yopmail 浏览器
+ *   4. 启动代理浏览器访问 restore 链接
+ *   5. 输入新密码 "123456789_Chen" 并点击 CONTINUE
+ *   6. 等待跳转到登录页面
+ *   7. 填写登录表单并提交
+ *   8. 获取 loginIp 和 cookies
+ *   9. 返回结果 { success, loginIp, cookiesJson }
+ */
+export async function handlePasswordResetAndRelogin(task, proxy) {
+    console.log('\n🔐 ==== 开始密码重置流程 ====\n');
+
+    // ========== 阶段 1: 无代理浏览器 → yopmail 获取 restore 链接 ==========
+    console.log('📬 阶段 1: 打开 yopmail 获取重置密码链接...');
+
+    let yopmailBrowser;
+    let resetLink = null;
+
+    try {
+        yopmailBrowser = await launch({
+            headless: isLinux,
+            humanize: true,
+            timezone: 'America/New_York',
+            locale: 'en-US',
+            viewport: { width: 1920, height: 1080 },
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+            ]
+        });
+
+        const yopmailPage = await yopmailBrowser.newPage();
+        await applyStealthPatches(yopmailPage);
+        await yopmailPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+        yopmailPage.setDefaultNavigationTimeout(60000);
+        yopmailPage.setDefaultTimeout(30000);
+        await yopmailPage.setViewport({ width: 1920, height: 1080 });
+
+        // 访问 yopmail
+        console.log('   🌐 访问 https://yopmail.net/ ...');
+        try {
+            await yopmailPage.goto('https://yopmail.net/', {
+                waitUntil: 'load',
+                timeout: 60000
+            });
+        } catch (e) {
+            console.log('   ⚠️  yopmail 加载超时，继续...');
+        }
+        await sleep(3000);
+
+        // 关闭广告弹窗
+        console.log('   🧹 关闭广告弹窗...');
+        for (let attempt = 0; attempt < 5; attempt++) {
+            await yopmailPage.evaluate(() => {
+                const closeSelectors = [
+                    '[aria-label="Close"]', '[aria-label="close"]', '.close', '.dismiss',
+                    '[class*="close" i]', '[class*="dismiss" i]', 'button[class*="close" i]',
+                    'div[class*="popup" i] button', 'div[class*="modal" i] button',
+                    'div[class*="overlay" i] button', 'div[class*="ad" i] button',
+                    'div[class*="ad" i] [class*="close" i]', 'iframe + button', 'button:has(svg)',
+                ];
+                for (const sel of closeSelectors) {
+                    try { document.querySelectorAll(sel).forEach(el => { if (el.offsetParent !== null) el.click(); }); } catch (_) {}
+                }
+                ['div[class*="overlay" i]', 'div[class*="popup" i]', 'div[class*="modal" i]',
+                 'div[class*="advertisement" i]', 'div[id*="google_ads" i]', 'ins.adsbygoogle']
+                    .forEach(sel => { try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch (_) {} });
+            });
+            await sleep(500);
+        }
+        console.log('   ✅ 广告弹窗处理完成');
+
+        // 提取邮箱前缀
+        const emailPrefix = task.email.split('@')[0];
+        console.log(`   📧 邮箱前缀: ${emailPrefix}`);
+
+        // 输入邮箱前缀
+        const inputSelectors = [
+            '#login', 'input[name="login"]', 'input[name="email"]',
+            'input[placeholder*="email" i]', 'input[placeholder*="mail" i]',
+            'input[placeholder*="Enter" i]', 'input[type="text"]',
+            'input:not([type="hidden"])',
+        ];
+
+        let inputFound = false;
+        for (const sel of inputSelectors) {
+            try {
+                const inputEl = await yopmailPage.$(sel);
+                if (inputEl) {
+                    await inputEl.click({ clickCount: 3 });
+                    await inputEl.type(emailPrefix, { delay: 30 });
+                    const val = await yopmailPage.$eval(sel, e => e.value);
+                    if (val === emailPrefix) {
+                        console.log(`   ✅ 已输入邮箱前缀: "${val}" (selector: ${sel})`);
+                        inputFound = true;
+                        await yopmailPage.keyboard.press('Enter');
+                        console.log('   ✅ 已按 Enter，进入邮箱');
+                        break;
+                    }
+                }
+            } catch (_) {}
+        }
+
+        if (!inputFound) {
+            console.warn('   ⚠️  未找到邮箱输入框');
+            await yopmailPage.screenshot({ path: 'step-reset-yopmail-input-failed.png', fullPage: true });
+            await yopmailBrowser.close();
+            return { success: false, error: '未找到 yopmail 邮箱输入框' };
+        }
+
+        // 等待邮箱加载
+        await sleep(5000);
+
+        // 再次清理广告
+        await yopmailPage.evaluate(() => {
+            ['div[class*="overlay" i]', 'div[class*="popup" i]', 'div[class*="modal" i]',
+             'div[class*="ad" i]', 'ins.adsbygoogle']
+                .forEach(sel => document.querySelectorAll(sel).forEach(el => { try { el.remove(); } catch (_) {} }));
+        });
+        await sleep(2000);
+
+        await yopmailPage.screenshot({ path: 'step-reset-yopmail-inbox.png', fullPage: true });
+        console.log('   📸 yopmail 截图已保存');
+
+        // 在邮件列表中查找 Adsterra 密码重置邮件
+        console.log('   🔍 查找密码重置邮件...');
+
+        const emailClicked = await yopmailPage.evaluate(() => {
+            const iframe = document.getElementById('ifinbox');
+            if (!iframe) return { found: false, error: 'ifinbox not found' };
+            try {
+                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                if (!doc) return { found: false, error: 'ifinbox doc not accessible' };
+
+                const items = doc.querySelectorAll('.m, .msg, .lm, [class*="message" i], [class*="email" i], div[onclick]');
+                for (const item of items) {
+                    const text = (item.textContent || '').toLowerCase();
+                    // 匹配密码重置邮件（包含 reset / restore / password 等关键词）
+                    if ((text.includes('reset') || text.includes('restore') || text.includes('password')) &&
+                        (text.includes('adsterra') || text.includes('publisher'))) {
+                        item.click();
+                        return { found: true, text: (item.textContent || '').trim().slice(0, 200) };
+                    }
+                }
+                // 降级：查找包含 "reset your password" 的邮件
+                for (const item of items) {
+                    const text = (item.textContent || '').toLowerCase();
+                    if (text.includes('reset your password') || text.includes('password reset') ||
+                        text.includes('restore your password') || text.includes('security update')) {
+                        item.click();
+                        return { found: true, text: (item.textContent || '').trim().slice(0, 200) };
+                    }
+                }
+                return { found: false, error: 'no matching reset email', itemCount: items.length };
+            } catch (e) {
+                return { found: false, error: e.message };
+            }
+        });
+
+        console.log(`   邮件查找结果: ${JSON.stringify(emailClicked)}`);
+
+        if (!emailClicked.found) {
+            console.warn('   ⚠️  未找到密码重置邮件');
+            await yopmailPage.screenshot({ path: 'step-reset-email-not-found.png', fullPage: true });
+            await yopmailBrowser.close();
+            return { success: false, error: '未找到密码重置邮件' };
+        }
+
+        console.log('   ✅ 已点击密码重置邮件，等待内容加载...');
+        await sleep(5000);
+
+        // 从邮件内容中获取 restore 链接
+        console.log('   🔗 获取密码重置链接...');
+
+        for (let retry = 0; retry < 6 && !resetLink; retry++) {
+            if (retry > 0) {
+                await sleep(2000);
+                console.log(`   ⏳ 重试获取链接... (${retry}/5)`);
+            }
+
+            resetLink = await yopmailPage.evaluate(() => {
+                const iframe = document.getElementById('ifmail');
+                if (iframe) {
+                    try {
+                        const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                        if (doc) {
+                            const links = doc.querySelectorAll('a');
+                            // 优先匹配 adsterra.com/restore/ 链接
+                            for (const a of links) {
+                                const href = a.href || '';
+                                if (href.includes('adsterra.com/restore/')) {
+                                    return { found: true, href, text: (a.textContent || '').trim(), source: 'ifmail', linkCount: links.length };
+                                }
+                            }
+                            // 降级：任何包含 restore 的 adsterra 链接
+                            for (const a of links) {
+                                const href = a.href || '';
+                                if (href.includes('adsterra.com') && (href.includes('restore') || href.includes('reset'))) {
+                                    return { found: true, href, text: (a.textContent || '').trim(), source: 'ifmail_fallback', linkCount: links.length };
+                                }
+                            }
+                            const bodyText = (doc.body?.innerText || '').slice(0, 300);
+                            return { found: false, iframeId: 'ifmail', bodyPreview: bodyText, linkCount: links.length };
+                        }
+                    } catch (_) {}
+                }
+                return { found: false, error: 'ifmail not accessible' };
+            });
+        }
+
+        if (!resetLink || !resetLink.found) {
+            console.warn('   ⚠️  未找到密码重置链接');
+            if (resetLink) {
+                console.log(`   诊断: ${JSON.stringify(resetLink)}`);
+            }
+            await yopmailPage.screenshot({ path: 'step-reset-link-not-found.png', fullPage: true });
+            await yopmailBrowser.close();
+            return { success: false, error: '未找到密码重置链接' };
+        }
+
+        console.log(`   ✅ 密码重置链接: ${resetLink.href}`);
+        await yopmailBrowser.close();
+        console.log('   🔒 已关闭 yopmail 浏览器');
+
+    } catch (error) {
+        console.error('   ❌ yopmail 流程出错:', error.message);
+        if (yopmailBrowser) {
+            try { await yopmailBrowser.close(); } catch (_) {}
+        }
+        return { success: false, error: `yopmail 流程出错: ${error.message}` };
+    }
+
+    // ========== 阶段 2: 代理浏览器 → 访问 restore 链接 → 设置新密码 → 重新登录 ==========
+    console.log('\n🔐 阶段 2: 访问密码重置链接并设置新密码...');
+
+    let proxyBrowser;
+    try {
+        proxyBrowser = await launch({
+            headless: isLinux,
+            proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+            humanize: true,
+            timezone: 'America/New_York',
+            locale: 'en-US',
+            viewport: { width: 1920, height: 1080 },
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+            ]
+        });
+
+        const restorePage = await proxyBrowser.newPage();
+        await applyStealthPatches(restorePage);
+        await restorePage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+        await restorePage.authenticate({
+            username: proxy.username,
+            password: proxy.password,
+        });
+        restorePage.setDefaultNavigationTimeout(60000);
+        restorePage.setDefaultTimeout(30000);
+        await restorePage.setViewport({ width: 1920, height: 1080 });
+
+        // 访问 restore 链接
+        console.log(`   🌐 访问 restore 链接...`);
+        try {
+            await restorePage.goto(resetLink.href, {
+                waitUntil: 'load',
+                timeout: 60000
+            });
+        } catch (e) {
+            console.log('   ⚠️  restore 页面加载超时，继续...');
+        }
+        await sleep(5000);
+
+        // 等待可能的 Cloudflare 挑战
+        console.log('   🛡️  等待 Cloudflare 挑战（如有）...');
+        const cfResult = await waitForCloudflareChallenge(restorePage, 60000);
+        if (cfResult === 'failed') {
+            console.log('   ❌ Cloudflare 挑战失败，无法继续');
+            await proxyBrowser.close();
+            return { success: false, error: 'Cloudflare 挑战失败' };
+        }
+        console.log(`   ✅ Cloudflare 状态: ${cfResult}`);
+
+        // 查找 New password 输入框并输入密码（使用 Puppeteer type 模拟真实输入）
+        console.log('   📝 输入新密码...');
+        const newPassword = '123456789_Chen';
+
+        // 先查找密码输入框是否存在，以及使用哪个选择器
+        const passwordSelector = await restorePage.evaluate(() => {
+            const selectors = [
+                'input[name="password"]',
+                'input[type="password"]',
+                'input[name="newPassword"]',
+                'input[name="new_password"]',
+                'input[placeholder*="password" i]',
+                'input[placeholder*="new" i]',
+                '#password',
+                '#newPassword',
+                '#text-field-newPassword',
+                '#text-field-password',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    return { selector: sel, id: el.id, name: el.name, type: el.type, placeholder: el.placeholder || '' };
+                }
+            }
+            // 调试：打印所有 input
+            const allInputs = Array.from(document.querySelectorAll('input')).map(i => ({
+                id: i.id, name: i.name, type: i.type, placeholder: i.placeholder,
+                className: i.className.slice(0, 60),
+            }));
+            const allButtons = Array.from(document.querySelectorAll('button')).map(b => ({
+                id: b.id, text: (b.textContent || '').trim().slice(0, 40),
+                className: b.className.slice(0, 60),
+            }));
+            return { selector: null, debug: { inputs: allInputs, buttons: allButtons } };
+        });
+
+        if (!passwordSelector.selector) {
+            console.warn('   ⚠️  未找到密码输入框，诊断信息:');
+            console.log(`      ${JSON.stringify(passwordSelector.debug)}`);
+            await restorePage.screenshot({ path: 'step-reset-no-password-input.png', fullPage: true });
+            await proxyBrowser.close();
+            return { success: false, error: '未找到新密码输入框' };
+        }
+
+        console.log(`   ✅ 找到密码输入框: ${passwordSelector.selector} (id=${passwordSelector.id}, name=${passwordSelector.name})`);
+
+        // 使用 type() 模拟真实键盘输入（React/MUI 需要）
+        const pwInput = await restorePage.$(passwordSelector.selector);
+        await pwInput.click();
+        await pwInput.click({ clickCount: 3 });  // 三击全选
+        await pwInput.type(newPassword, { delay: 50 });
+
+        // 验证输入
+        const actualValue = await restorePage.$eval(passwordSelector.selector, el => el.value);
+        console.log(`   ✅ 已输入新密码: "${'*'.repeat(actualValue.length)}"${actualValue === newPassword ? ' ✔' : ' ✗'}`);
+        await sleep(1000);
+
+        // 查找 CONTINUE 按钮并点击
+        console.log('   🔘 查找 CONTINUE 按钮...');
+        const continueClicked = await restorePage.evaluate(() => {
+            const allElements = document.querySelectorAll('button, a, input[type="submit"], [role="button"]');
+            for (const el of allElements) {
+                const text = (el.textContent || '').trim().toUpperCase();
+                const value = ((el.value || '')).toUpperCase();
+                if (text === 'CONTINUE' || text === 'SUBMIT' || text === 'RESET' || text === 'RESET PASSWORD' ||
+                    value === 'CONTINUE' || value === 'SUBMIT' || value === 'RESET') {
+                    el.click();
+                    return { found: true, text: (el.textContent || el.value || '').trim().slice(0, 30), tag: el.tagName };
+                }
+            }
+            // 降级：找页面上第一个可点击的提交按钮
+            for (const el of allElements) {
+                const type = el.getAttribute('type') || '';
+                if (type === 'submit') {
+                    el.click();
+                    return { found: true, text: (el.textContent || el.value || '').trim().slice(0, 30), tag: el.tagName, method: 'type_submit' };
+                }
+            }
+            // 降级：找 form.submit()
+            const form = document.querySelector('form');
+            if (form) {
+                form.submit();
+                return { found: true, text: 'form.submit()', method: 'form_submit' };
+            }
+            return { found: false };
+        });
+
+        if (!continueClicked.found) {
+            console.warn('   ⚠️  未找到 CONTINUE 按钮');
+            await restorePage.screenshot({ path: 'step-reset-no-continue-button.png', fullPage: true });
+            await proxyBrowser.close();
+            return { success: false, error: '未找到 CONTINUE 按钮' };
+        }
+
+        console.log(`   ✅ 已点击 ${continueClicked.text} 按钮`);
+        await sleep(3000);
+
+        // 等待页面跳转到登录页
+        console.log('   ⏳ 等待跳转到登录页面...');
+        let redirectedToLogin = false;
+        for (let i = 0; i < 30; i++) {
+            const curUrl = restorePage.url();
+            if (curUrl.includes('publishers.adsterra.com/login')) {
+                console.log(`   ✅ 已跳转到登录页面 (${i * 2}s)`);
+                redirectedToLogin = true;
+                break;
+            }
+            await sleep(2000);
+            if (i % 5 === 0) {
+                console.log(`   ⏳ 等待中... (${i * 2}s) URL: ${curUrl}`);
+            }
+        }
+
+        if (!redirectedToLogin) {
+            console.warn(`   ⚠️  未跳转到登录页面，当前 URL: ${restorePage.url()}`);
+            await restorePage.screenshot({ path: 'step-reset-no-redirect.png', fullPage: true });
+            // 即使没跳转，也尝试继续
+        }
+
+        // ========== 阶段 3: 重新登录 ==========
+        console.log('\n🔑 阶段 3: 使用新密码重新登录...');
+
+        // 处理可能的 cookie 弹窗
+        console.log('   🍪 检查 Cookie 弹窗...');
+        for (let retry = 0; retry < 6; retry++) {
+            await sleep(2000);
+            const cookieResult = await restorePage.evaluate(() => {
+                const dialog = document.querySelector('#CybotCookiebotDialog');
+                if (dialog) {
+                    const buttons = dialog.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const btnId = btn.id || '';
+                        const btnText = (btn.textContent || '').toLowerCase().trim();
+                        if (btnId.includes('LevelOptinAllowAll') || btnText === 'allow all') {
+                            btn.click();
+                            return { found: true };
+                        }
+                    }
+                    if (buttons.length > 0) { buttons[0].click(); return { found: true }; }
+                }
+                return { found: false };
+            });
+            if (cookieResult.found) {
+                console.log('   ✅ Cookie 弹窗已关闭');
+                await sleep(2000);
+                break;
+            }
+        }
+
+        // 填写登录表单前先处理 Cloudflare 挑战
+        console.log('   🛡️  等待 Cloudflare 挑战完成（登录页）...');
+        const cfBeforeLogin = await waitForCloudflareChallenge(restorePage, 90000);
+        if (cfBeforeLogin === 'failed') {
+            console.log('   ❌ Cloudflare 挑战失败，无法继续');
+            await proxyBrowser.close();
+            return { success: false, error: 'Cloudflare 挑战失败' };
+        }
+        console.log(`   ✅ Cloudflare 状态: ${cfBeforeLogin}`);
+
+        // 填写登录表单
+        console.log('   📝 填写登录表单...');
+        await fillLoginForm(restorePage, task.email, newPassword);
+
+        // 提交登录
+        console.log('   🎯 提交登录...');
+        const loginSuccess = await submitLoginForm(restorePage);
+
+        let loginIp = null;
+        let cookiesJson = null;
+
+        if (loginSuccess) {
+            console.log('   ✅ 密码重置后登录成功！');
+
+            // 获取登录 IP
+            console.log('   🌐 获取登录 IP...');
+            try {
+                loginIp = await getLoginIp(restorePage, 40);
+                if (loginIp) console.log(`   ✅ 登录 IP: ${loginIp}`);
+            } catch (e) {
+                console.log(`   ⚠️  获取 IP 失败: ${e.message}`);
+            }
+
+            // 等待 60s 后获取 cookies
+            console.log('   ⏳ 等待 60 秒后获取 cookies...');
+            for (let i = 0; i < 12; i++) {
+                await sleep(5000);
+                console.log(`   ⏳ 等待中... (${(i + 1) * 5}s)`);
+            }
+
+            try {
+                cookiesJson = await getCookiesJson(restorePage);
+            } catch (e) {
+                console.log(`   ⚠️  获取 cookies 失败: ${e.message}`);
+            }
+
+            await restorePage.screenshot({ path: 'step-reset-login-success.png', fullPage: false });
+
+            await proxyBrowser.close();
+            console.log('\n🔐 ==== 密码重置流程完成 ====\n');
+            return { success: true, loginIp, cookiesJson };
+        } else {
+            console.log('   ❌ 密码重置后登录仍然失败');
+            await restorePage.screenshot({ path: 'step-reset-relogin-failed.png', fullPage: false });
+            await proxyBrowser.close();
+            return { success: false, error: '密码重置后登录仍失败' };
+        }
+
+    } catch (error) {
+        console.error('   ❌ 重置流程出错:', error.message);
+        if (proxyBrowser) {
+            try { await proxyBrowser.close(); } catch (_) {}
+        }
+        return { success: false, error: `重置流程出错: ${error.message}` };
+    }
+}
+
+/**
  * 获取当前页面所有 cookies 并序列化为 JSON 字符串
  */
 async function getCookiesJson(page) {
@@ -739,6 +1295,66 @@ export async function loginCrawler(task, proxy, _cookies = null) {
 
             } else {
                 console.log('⚠️  登录未完成，页面 URL: ' + publisherPage.url());
+
+                // 等待页面加载完成，确保错误信息已渲染
+                await sleep(5000);
+
+                // 诊断页面内容
+                const pageDiag = await publisherPage.evaluate(() => {
+                    const bodyText = (document.body?.innerText || '').toLowerCase();
+                    const toastEl = document.querySelector('[class*="toast" i], [class*="alert" i], [class*="message" i], [class*="notification" i], [role="alert"]');
+                    const toastText = toastEl ? (toastEl.textContent || '').trim().slice(0, 200) : '';
+                    return {
+                        bodyPreview: bodyText.slice(0, 1000),
+                        toastText,
+                        url: window.location.href,
+                        title: document.title,
+                    };
+                });
+                console.log('   📋 页面诊断:');
+                console.log(`      URL: ${pageDiag.url}`);
+                console.log(`      Title: ${pageDiag.title}`);
+                if (pageDiag.toastText) console.log(`      Toast: ${pageDiag.toastText}`);
+                console.log(`      Body preview: ${pageDiag.bodyPreview.slice(0, 300)}`);
+
+                // 检查是否因安全策略更新导致密码被重置
+                const needsReset = await checkPasswordResetMessage(publisherPage);
+
+                if (needsReset) {
+                    console.log('\n🔄 检测到密码重置提示，启动密码重置流程...');
+                    await browser.close(); // 关闭当前浏览器，让 handlePasswordResetAndRelogin 自行管理浏览器
+
+                    const resetResult = await handlePasswordResetAndRelogin(task, proxy);
+
+                    if (resetResult.success) {
+                        loginIp = resetResult.loginIp;
+                        cookiesJson = resetResult.cookiesJson;
+
+                        // 更新数据库
+                        if (task.email) {
+                            console.log('\n💾 更新数据库（密码重置后）...');
+                            try {
+                                await updateAccountInDb(task.email, loginIp, cookiesJson || '');
+                            } catch (e) {
+                                console.log(`   ⚠️  数据库更新失败: ${e.message}`);
+                            }
+                        }
+
+                        // 重置流程中已关闭浏览器，打印最终信息后直接返回
+                        console.log('\n========================================');
+                        console.log('✅ Login 爬虫执行完成（密码重置后）！');
+                        if (loginIp) console.log(`🌐 登录 IP: ${loginIp}`);
+                        console.log('========================================\n');
+
+                        return { success: true, url: 'https://beta.publishers.adsterra.com/login', loginIp };
+                    }
+
+                    // 重置失败，返回错误
+                    console.log('❌ 密码重置流程失败');
+                    return { success: false, retryable: false, error: resetResult.error || '密码重置流程失败' };
+                } else {
+                    console.log('⚠️  登录未完成，页面 URL: ' + publisherPage.url());
+                }
             }
 
             // 截图保存
