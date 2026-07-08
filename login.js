@@ -962,103 +962,22 @@ export async function handlePasswordResetAndRelogin(task, proxy) {
         if (!redirectedToLogin) {
             console.warn(`   ⚠️  未跳转到登录页面，当前 URL: ${restorePage.url()}`);
             await restorePage.screenshot({ path: 'step-reset-no-redirect.png', fullPage: true });
-            // 即使没跳转，也尝试继续
         }
 
-        // ========== 阶段 3: 重新登录 ==========
-        console.log('\n🔑 阶段 3: 使用新密码重新登录...');
-
-        // 处理可能的 cookie 弹窗
-        console.log('   🍪 检查 Cookie 弹窗...');
-        for (let retry = 0; retry < 6; retry++) {
-            await sleep(2000);
-            const cookieResult = await restorePage.evaluate(() => {
-                const dialog = document.querySelector('#CybotCookiebotDialog');
-                if (dialog) {
-                    const buttons = dialog.querySelectorAll('button');
-                    for (const btn of buttons) {
-                        const btnId = btn.id || '';
-                        const btnText = (btn.textContent || '').toLowerCase().trim();
-                        if (btnId.includes('LevelOptinAllowAll') || btnText === 'allow all') {
-                            btn.click();
-                            return { found: true };
-                        }
-                    }
-                    if (buttons.length > 0) { buttons[0].click(); return { found: true }; }
-                }
-                return { found: false };
-            });
-            if (cookieResult.found) {
-                console.log('   ✅ Cookie 弹窗已关闭');
-                await sleep(2000);
-                break;
-            }
-        }
-
-        // 填写登录表单前先处理 Cloudflare 挑战
-        console.log('   🛡️  等待 Cloudflare 挑战完成（登录页）...');
-        const cfBeforeLogin = await waitForCloudflareChallenge(restorePage, 90000);
-        if (cfBeforeLogin === 'failed') {
-            console.log('   ❌ Cloudflare 挑战失败，无法继续');
-            await proxyBrowser.close();
-            return { success: false, error: 'Cloudflare 挑战失败' };
-        }
-        console.log(`   ✅ Cloudflare 状态: ${cfBeforeLogin}`);
-
-        // 填写登录表单
-        console.log('   📝 填写登录表单...');
-        await fillLoginForm(restorePage, task.email, newPassword);
-
-        // 提交登录
-        console.log('   🎯 提交登录...');
-        const loginSuccess = await submitLoginForm(restorePage);
-
-        let loginIp = null;
-        let cookiesJson = null;
-
-        if (loginSuccess) {
-            console.log('   ✅ 密码重置后登录成功！');
-
-            // 获取登录 IP
-            console.log('   🌐 获取登录 IP...');
-            try {
-                loginIp = await getLoginIp(restorePage, 40);
-                if (loginIp) console.log(`   ✅ 登录 IP: ${loginIp}`);
-            } catch (e) {
-                console.log(`   ⚠️  获取 IP 失败: ${e.message}`);
-            }
-
-            // 等待 60s 后获取 cookies
-            console.log('   ⏳ 等待 60 秒后获取 cookies...');
-            for (let i = 0; i < 12; i++) {
-                await sleep(5000);
-                console.log(`   ⏳ 等待中... (${(i + 1) * 5}s)`);
-            }
-
-            try {
-                cookiesJson = await getCookiesJson(restorePage);
-            } catch (e) {
-                console.log(`   ⚠️  获取 cookies 失败: ${e.message}`);
-            }
-
-            await restorePage.screenshot({ path: 'step-reset-login-success.png', fullPage: false });
-
-            await proxyBrowser.close();
-            console.log('\n🔐 ==== 密码重置流程完成 ====\n');
-            return { success: true, loginIp, cookiesJson };
-        } else {
-            console.log('   ❌ 密码重置后登录仍然失败');
-            await restorePage.screenshot({ path: 'step-reset-relogin-failed.png', fullPage: false });
-            await proxyBrowser.close();
-            return { success: false, error: '密码重置后登录仍失败' };
-        }
+        // 密码重置成功，关闭浏览器，返回重试状态让 loginCrawler 重新登录
+        console.log('\n✅ 密码重置成功！返回重试状态，等待 loginCrawler 重新登录...');
+        await proxyBrowser.close();
+        console.log('\n🔐 ==== 密码重置流程完成 ====\n');
+        throw new Error("重试登录")
+        // return { success: false, retryable: true, error: '密码已重置，等待重试登录' };
 
     } catch (error) {
         console.error('   ❌ 重置流程出错:', error.message);
         if (proxyBrowser) {
             try { await proxyBrowser.close(); } catch (_) {}
         }
-        return { success: false, error: `重置流程出错: ${error.message}` };
+        throw error;
+        // return { success: false, retryable: false, error: `重置流程出错: ${error.message}` };
     }
 }
 
@@ -1325,29 +1244,6 @@ export async function loginCrawler(task, proxy, _cookies = null) {
                     await browser.close(); // 关闭当前浏览器，让 handlePasswordResetAndRelogin 自行管理浏览器
 
                     const resetResult = await handlePasswordResetAndRelogin(task, proxy);
-
-                    if (resetResult.success) {
-                        loginIp = resetResult.loginIp;
-                        cookiesJson = resetResult.cookiesJson;
-
-                        // 更新数据库
-                        if (task.email) {
-                            console.log('\n💾 更新数据库（密码重置后）...');
-                            try {
-                                await updateAccountInDb(task.email, loginIp, cookiesJson || '');
-                            } catch (e) {
-                                console.log(`   ⚠️  数据库更新失败: ${e.message}`);
-                            }
-                        }
-
-                        // 重置流程中已关闭浏览器，打印最终信息后直接返回
-                        console.log('\n========================================');
-                        console.log('✅ Login 爬虫执行完成（密码重置后）！');
-                        if (loginIp) console.log(`🌐 登录 IP: ${loginIp}`);
-                        console.log('========================================\n');
-
-                        return { success: true, url: 'https://beta.publishers.adsterra.com/login', loginIp };
-                    }
 
                     // 重置失败，返回错误
                     console.log('❌ 密码重置流程失败');
