@@ -21,11 +21,11 @@ const CRAWLER_DISPATCH = {
     'LOGIN': loginCrawler,
     // 'ACCOUNT': accountCrawler,
     // 'PAYOUT': payoutCrawler,
-    'CREATE_API_TOKEN': createApiTokenCrawler,
-    'CREATE_LINK': createLinkCrawler,
-    'CREATE_PAYOUT': createPayoutCrawler,
-    'CHANGE_NAME': changeNameCrawler,
-    'UPDATE_USDT_ADDRESS': updateUsdtAddressCrawler,
+    //'CREATE_API_TOKEN': createApiTokenCrawler,
+    //'CREATE_LINK': createLinkCrawler,
+    //'CREATE_PAYOUT': createPayoutCrawler,
+    //'CHANGE_NAME': changeNameCrawler,
+    //'UPDATE_USDT_ADDRESS': updateUsdtAddressCrawler,
 };
 
 /**
@@ -51,7 +51,6 @@ async function mainLoop() {
             console.log(`⏳ ${POLL_INTERVAL * 10/ 1000}s 后重试...\n`);
             await sleep(POLL_INTERVAL * 10);
         }
-
     }
 }
 
