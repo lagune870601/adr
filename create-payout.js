@@ -165,7 +165,7 @@ export async function createPayoutCrawler(task, proxy, cookies) {
         await fillInput(page, 'Last name', lastName);
 
         // 填写 Full home address（加随机后缀确保表单数据有变化，使 SAVE CHANGES 按钮可点击）
-        const addressWithRandom = task.address + ' ' + Math.random().toString(36).substring(2, 6);
+        const addressWithRandom = task.address;
         console.log(`   📝 Full home address: ${addressWithRandom}`);
         await fillInput(page, 'Full home address', addressWithRandom);
 

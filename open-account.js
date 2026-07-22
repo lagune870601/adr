@@ -18,7 +18,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'phil.carlo@xikemail.com';
+const DEFAULT_ACCOUNT = 'gav.bull@totococo.fr.nf';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
@@ -173,7 +173,7 @@ async function accountCrawler() {
             humanize: true,
             timezone: 'America/New_York',
             locale: 'en-US',
-            viewport: { width: 1920, height: 1080 },
+            viewport: { width: 1360, height: 768 },
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -198,7 +198,7 @@ async function accountCrawler() {
         page.setDefaultTimeout(30000);
 
         // 设置视口大小
-        await page.setViewport({ width: 1920, height: 1080 });
+        await page.setViewport({ width: 1366, height: 768 });
 
         // 步骤 4: 访问 login 页面建立 domain
         console.log(`\n🌐 步骤 4: 访问 ${LOGIN_URL} 建立 domain...`);
