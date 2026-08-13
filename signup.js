@@ -451,6 +451,110 @@ async function waitForCloudflareChallenge(page, maxWaitMs = 90000) {
     return 'timeout';
 }
 
+/**
+ * 查找 MUI Autocomplete 的国家输入框
+ * 使用多种策略，不依赖动态生成的 ID
+ */
+async function findCountryInput(page) {
+    // 策略 1: 通过 placeholder 查找
+    const byPlaceholder = await page.evaluate(() => {
+        const inputs = document.querySelectorAll('input');
+        for (const el of inputs) {
+            const ph = (el.placeholder || '').toLowerCase();
+            if (ph.includes('country') || ph.includes('select')) {
+                return { found: true, id: el.id, placeholder: el.placeholder };
+            }
+        }
+        return { found: false };
+    });
+    if (byPlaceholder.found) {
+        console.log(`   ℹ️  通过 placeholder 找到国家输入框: #${byPlaceholder.id}`);
+        return `#${byPlaceholder.id}`;
+    }
+
+    // 策略 2: 通过 aria-label / aria-labelledby 查找
+    const byAria = await page.evaluate(() => {
+        const inputs = document.querySelectorAll('input[aria-autocomplete="list"]');
+        for (const el of inputs) {
+            const label = el.getAttribute('aria-label') || '';
+            if (label.toLowerCase().includes('country')) {
+                return { found: true, id: el.id, ariaLabel: label };
+            }
+            // 检查 aria-labelledby 指向的 label
+            const labelledBy = el.getAttribute('aria-labelledby');
+            if (labelledBy) {
+                const labelEl = document.getElementById(labelledBy);
+                if (labelEl && labelEl.textContent.toLowerCase().includes('country')) {
+                    return { found: true, id: el.id, ariaLabelledBy: labelledBy };
+                }
+            }
+        }
+        return { found: false };
+    });
+    if (byAria.found) {
+        console.log(`   ℹ️  通过 aria-label 找到国家输入框: #${byAria.id}`);
+        return `#${byAria.id}`;
+    }
+
+    // 策略 3: 查找 label 文本为 "Country" 的关联输入框
+    const byLabel = await page.evaluate(() => {
+        const labels = document.querySelectorAll('label');
+        for (const label of labels) {
+            if (label.textContent.toLowerCase().includes('country')) {
+                const forAttr = label.getAttribute('for');
+                if (forAttr) {
+                    const input = document.getElementById(forAttr);
+                    if (input) {
+                        return { found: true, id: input.id, labelText: label.textContent };
+                    }
+                }
+                // 如果 label 包裹了 input
+                const input = label.querySelector('input');
+                if (input) {
+                    return { found: true, id: input.id, labelText: label.textContent };
+                }
+            }
+        }
+        return { found: false };
+    });
+    if (byLabel.found) {
+        console.log(`   ℹ️  通过 label 找到国家输入框: #${byLabel.id}`);
+        return `#${byLabel.id}`;
+    }
+
+    // 策略 4: 查找 MUI Autocomplete 根元素，然后找其内部的 input
+    const byMuiRoot = await page.evaluate(() => {
+        const roots = document.querySelectorAll('.MuiAutocomplete-root');
+        for (const root of roots) {
+            const input = root.querySelector('input');
+            if (input && input.id) {
+                return { found: true, id: input.id };
+            }
+        }
+        return { found: false };
+    });
+    if (byMuiRoot.found) {
+        console.log(`   ℹ️  通过 MUI Autocomplete root 找到国家输入框: #${byMuiRoot.id}`);
+        return `#${byMuiRoot.id}`;
+    }
+
+    // 策略 5: 兜底 — 找第一个 aria-autocomplete="list" 的 input
+    const fallback = await page.evaluate(() => {
+        const input = document.querySelector('input[aria-autocomplete="list"]');
+        if (input && input.id) {
+            return { found: true, id: input.id };
+        }
+        return { found: false };
+    });
+    if (fallback.found) {
+        console.log(`   ℹ️  兜底找到 Autocomplete 输入框: #${fallback.id}`);
+        return `#${fallback.id}`;
+    }
+
+    console.warn('   ⚠️  未找到国家输入框');
+    return null;
+}
+
 export async function signupCrawler(task, proxy) {
     console.log('🚀 启动 CloakBrowser (Sign Up 爬虫)...\n');
 
@@ -1007,10 +1111,16 @@ export async function signupCrawler(task, proxy) {
                         // 步骤 7: 国家下拉框选中 "United States"
                         console.log('\n🌍 步骤 7: 国家下拉框选中 "United States"...');
 
-                        // MUI Autocomplete: 点击 → 输入 → 选择
-                        await targetPage.click('#_r_c_');
+                        // MUI Autocomplete: 动态查找输入框 → 输入 → 选择
+                        const countrySelector = await findCountryInput(targetPage);
+                        if (!countrySelector) {
+                            throw new Error('未找到国家下拉输入框，请检查页面结构');
+                        }
+                        console.log(`   ℹ️  使用选择器: ${countrySelector}`);
+
+                        await targetPage.click(countrySelector);
                         await sleep(500);
-                        await targetPage.type('#_r_c_', 'United', { delay: 100 });
+                        await targetPage.type(countrySelector, 'United', { delay: 100 });
                         await sleep(1500);
 
                         await targetPage.evaluate(() => {
@@ -1025,8 +1135,12 @@ export async function signupCrawler(task, proxy) {
                         });
                         await sleep(500);
 
-                        const countryValue = await targetPage.$eval('#_r_c_', el => el.value);
-                        console.log(`   ✅ 国家: "${countryValue}"`);
+                        // 读取国家输入框的值验证
+                        const countryValueFinal = await targetPage.evaluate((sel) => {
+                            const el = document.querySelector(sel);
+                            return el ? el.value : 'not found';
+                        }, countrySelector);
+                        console.log(`   ✅ 国家: "${countryValueFinal}"`);
 
                         // 步骤 8: 密码输入框固定输入 "123456789_Chen"
                         console.log('\n🔐 步骤 8: 输入固定密码...');

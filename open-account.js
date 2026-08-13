@@ -18,7 +18,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'gav.bull@totococo.fr.nf';
+const DEFAULT_ACCOUNT = 'pasadoll@traodoinick.com';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
