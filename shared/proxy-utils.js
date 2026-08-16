@@ -70,7 +70,7 @@ async function retryWithBackoff(fn, label, maxRetries = MAX_RETRIES) {
  * @param {string} [options.protocol='http'] - 协议 (http / socks5)
  * @returns {Promise<{ proxy: {host, port, username, password}, manager: object }>}
  */
-export async function createProxy(options = {}) {
+export async function createProxyFromAPI(options = {}) {
     const {
         apiKey = PROXY_API_KEY,
         country = 'US',
@@ -176,6 +176,47 @@ export async function createProxy(options = {}) {
     // 8. 构造 manager 对象（保持向后兼容）
     const manager = {
         _sdk: sdk,
+        stop() {},
+        destroy() {},
+        async getProxy() {
+            return proxy;
+        },
+        async getStatus() {
+            return { started: true, packageValid: true, proxy: { current: proxy } };
+        },
+    };
+
+    return { proxy, manager };
+}
+
+// ──────────────────────── 固定代理 ────────────────────────
+
+const FIXED_PROXY_URL = 'socks5://104.233.202.50:7891';
+const FIXED_PROXY_HOST = '104.233.202.50';
+const FIXED_PROXY_PORT = 7891;
+
+/**
+ * 使用固定 SOCKS5 代理（替代 Proxy-Seller API）
+ *
+ * 原 createProxyFromAPI 保留但不再使用，如需切换回 API 方式，
+ * 将下方 createProxy 改为调用 createProxyFromAPI 即可。
+ *
+ * @returns {Promise<{ proxy: {url, host, port, username, password}, manager: object }>}
+ */
+export async function createProxy(_options = {}) {
+    console.log('🔌 使用固定代理...');
+
+    const proxy = {
+        url: FIXED_PROXY_URL,
+        host: FIXED_PROXY_HOST,
+        port: FIXED_PROXY_PORT,
+        username: '',
+        password: '',
+    };
+
+    console.log(`   📡 代理地址: ${proxy.host}:${proxy.port} (SOCKS5)`);
+
+    const manager = {
         stop() {},
         destroy() {},
         async getProxy() {

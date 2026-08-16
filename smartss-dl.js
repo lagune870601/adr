@@ -9,8 +9,8 @@ const isLinux = os.platform() === 'linux';
 
 // 目标 URL 数组，每个链接可配置每日访问量
 const TARGET_URLS = [
-    //{ url: 'https://smartss.top/serve/dl.php?user=NjgxMA%3D%3D', dailyVisits: 1000 },
-    { url: 'https://omg10.com/4/8839467', dailyVisits: 500 },
+    { url: 'https://smartss.top/serve/dl.php?user=NjgxMA%3D%3D', dailyVisits: 1000 },
+   // { url: 'https://omg10.com/4/8839467', dailyVisits: 500 },
     // { url: 'https://example.com/page2', dailyVisits: 500 },
     // { url: 'https://example.com/page3', dailyVisits: 1000 },
 ];
@@ -78,7 +78,7 @@ async function handleVerification(page) {
 async function doVisit(targetUrl, proxy) {
     const browser = await launch({
         headless: isLinux,
-        proxy: 'socks5://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+        proxy: proxy.url,
         humanize: true,
         timezone: 'America/New_York',
         locale: 'en-US',

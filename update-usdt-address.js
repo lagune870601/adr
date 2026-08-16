@@ -37,7 +37,7 @@ export async function updateUsdtAddressCrawler(task, proxy, cookies) {
     try {
         browser = await launch({
             headless: isLinux,
-            proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+            proxy: proxy.url,
             humanize: true,
             timezone: 'America/New_York',
             locale: 'en-US',

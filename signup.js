@@ -448,8 +448,14 @@ async function waitForCloudflareChallenge(page, maxWaitMs = 90000) {
     return 'timeout';
 }
 
-export async function signupCrawler(task, proxy) {
-    console.log('🚀 启动 CloakBrowser (Sign Up 爬虫)...\n');
+/**
+ * @param {object} task - 任务对象 { id, username, email, ... }
+ * @param {object} proxy - 代理对象 { host, port, username, password, url }
+ * @param {object} [existingBrowser] - 可选，已连接的 Puppeteer Browser 实例（AdsPower 等外部浏览器）
+ */
+export async function signupCrawler(task, proxy, existingBrowser = null) {
+    const isExternalBrowser = !!existingBrowser;
+    console.log(`🚀 启动${isExternalBrowser ? ' AdsPower' : ' CloakBrowser'} (Sign Up 爬虫)...\n`);
 
     console.log(`👤 姓名: ${task.username}`);
     console.log(`📧 邮箱: ${task.email}`);
@@ -471,26 +477,32 @@ export async function signupCrawler(task, proxy) {
         let proxyManager;  // 用于 confirm link 阶段的代理
 
         try {
-            const platform = os.platform();
-            console.log(`🖥️  当前平台: ${platform} (${isLinux ? '无头模式' : '窗口模式'})`);
-            console.log(`   📡 代理: ${proxy.host}:${proxy.port}`);
+            if (isExternalBrowser) {
+                // 使用外部传入的浏览器（AdsPower 等）
+                browser = existingBrowser;
+                console.log('✅ 使用外部浏览器实例');
+            } else {
+                const platform = os.platform();
+                console.log(`🖥️  当前平台: ${platform} (${isLinux ? '无头模式' : '窗口模式'})`);
+                console.log(`   📡 代理: ${proxy.host}:${proxy.port}`);
 
-            // 启动 CloakBrowser - Linux 使用无头模式，Windows 使用窗口模式
-            browser = await launch({
-                headless: isLinux,
-                proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
-                humanize: true,
-                timezone: 'America/New_York',
-                locale: 'en-US',
-                viewport: { width: 1920, height: 1080 },
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--disable-gpu',
-                ]
-            });
+                // 启动 CloakBrowser - 临时写死为无头模式进行测试
+                browser = await launch({
+                    headless: isLinux,
+                    proxy: proxy.url,
+                    humanize: true,
+                    timezone: 'America/New_York',
+                    locale: 'en-US',
+                    viewport: { width: 1920, height: 1080 },
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-gpu',
+                    ]
+                });
+            }
 
             console.log('📖 创建新页面...');
             const page = await browser.newPage();
@@ -953,61 +965,266 @@ export async function signupCrawler(task, proxy) {
                         // 步骤 6: 选择 Messenger 并填写账号
                         console.log('\n📋 步骤 6: 选择 Messenger 并填写随机账号...');
 
-                        // 点击 Messenger 下拉框
-                        await targetPage.click('#mui-component-select-messenger');
-                        await sleep(1000);
-
-                        // 获取选项（排除 WeChat）
-                        const messengerOptions = await targetPage.evaluate(() => {
-                            return Array.from(document.querySelectorAll('[role="option"]'))
-                                .map(el => ({ text: el.textContent.trim(), value: el.getAttribute('data-value') }))
-                                .filter(o => o.text !== 'WeChat');
-                        });
-                        console.log(`   可用选项: ${messengerOptions.map(o => o.text).join(', ')}`);
-
-                        // 随机选一个
-                        const chosen = messengerOptions[Math.floor(Math.random() * messengerOptions.length)];
-                        console.log(`   🎯 随机选择: "${chosen.text}"`);
-
-                        // 点击选项
-                        await targetPage.evaluate((value) => {
-                            const option = document.querySelector(`[role="option"][data-value="${value}"]`);
-                            if (option) option.click();
-                        }, chosen.value);
-                        await sleep(500);
-
-                        // 等待 Messenger Account 输入框变为可输入
-                        console.log('   ⏳ 等待 Messenger Account 输入框变为可输入...');
-                        for (let i = 0; i < 10; i++) {
-                            const disabled = await targetPage.$eval('#text-field-messengerAccount', el => el.disabled);
-                            if (!disabled) {
-                                console.log(`   ✅ 输入框已可输入`);
-                                break;
+                        // 先 dump 页面中 Messenger 相关的 DOM 结构用于调试
+                        const messengerDomInfo = await targetPage.evaluate(() => {
+                            const info = {};
+                            // 查找 messenger select
+                            const select = document.querySelector('#mui-component-select-messenger');
+                            if (select) {
+                                info.tagName = select.tagName;
+                                info.id = select.id;
+                                info.className = select.className;
+                                info.textContent = select.textContent?.trim();
+                                info.role = select.getAttribute('role');
+                                // 父级结构
+                                const parent = select.closest('.MuiFormControl-root, .MuiInputBase-root');
+                                if (parent) {
+                                    info.parentClass = parent.className;
+                                    const label = parent.querySelector('label');
+                                    info.label = label?.textContent?.trim();
+                                }
                             }
+                            // 查找所有可能的菜单容器
+                            const menu = document.querySelector('.MuiMenu-root, .MuiPopover-root, [role="listbox"]');
+                            info.menuExists = !!menu;
+                            if (menu) {
+                                info.menuClass = menu.className;
+                                info.menuChildren = menu.querySelectorAll('li, [role="option"]').length;
+                            }
+                            return info;
+                        });
+                        console.log('   🔍 Messenger DOM 调试:', JSON.stringify(messengerDomInfo, null, 2));
+
+                        // 点击 Messenger 下拉框（使用 evaluate 确保触发 MUI 事件）
+                        const dropdownOpened = await targetPage.evaluate(() => {
+                            const select = document.querySelector('#mui-component-select-messenger');
+                            if (!select) return false;
+                            // 触发 mousedown + click 确保 MUI 响应
+                            select.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                            select.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                            select.click();
+                            return true;
+                        });
+                        console.log(`   下拉框点击: ${dropdownOpened ? '✅' : '❌'}`);
+                        await sleep(1500);
+
+                        // 获取选项（排除 WeChat）- 使用多种选择器
+                        let messengerOptions = await targetPage.evaluate(() => {
+                            const selectors = [
+                                '[role="option"]',
+                                'li[data-value]',
+                                '.MuiMenuItem-root',
+                                'ul[role="listbox"] li',
+                                '.MuiMenu-list li',
+                            ];
+                            for (const sel of selectors) {
+                                const els = document.querySelectorAll(sel);
+                                if (els.length > 0) {
+                                    console.log(`[DEBUG] Found ${els.length} options via "${sel}"`);
+                                    return Array.from(els)
+                                        .map(el => ({
+                                            text: el.textContent?.trim() || '',
+                                            value: el.getAttribute('data-value') || el.getAttribute('value') || '',
+                                            selector: sel,
+                                        }))
+                                        .filter(o => o.text && o.text !== 'WeChat');
+                                }
+                            }
+                            return [];
+                        });
+                        console.log(`   可用选项: ${messengerOptions.map(o => o.text).join(', ') || '(无)'}`);
+
+                        if (messengerOptions.length === 0) {
+                            console.warn('   ⚠️  无法找到 Messenger 选项，跳过此步骤');
+                        } else {
+                            // 随机选一个
+                            const chosen = messengerOptions[Math.floor(Math.random() * messengerOptions.length)];
+                            console.log(`   🎯 随机选择: "${chosen.text}"`);
+
+                            // 使用 Puppeteer 原生 click 点击选项（更可靠）
+                            let optionClicked = false;
+                            try {
+                                // 方法1: 通过文本内容点击
+                                const optionEl = await targetPage.evaluateHandle((text) => {
+                                    const selectors = ['[role="option"]', 'li[data-value]', '.MuiMenuItem-root', 'ul[role="listbox"] li'];
+                                    for (const sel of selectors) {
+                                        const els = document.querySelectorAll(sel);
+                                        for (const el of els) {
+                                            if (el.textContent?.trim() === text) return el;
+                                        }
+                                    }
+                                    return null;
+                                }, chosen.text);
+
+                                if (optionEl && optionEl.asElement()) {
+                                    await optionEl.asElement().click();
+                                    optionClicked = true;
+                                    console.log(`   ✅ 已点击选项元素`);
+                                }
+                            } catch (e) {
+                                console.warn(`   ⚠️  方法1失败: ${e.message}`);
+                            }
+
+                            // 方法2: 如果方法1失败，用 evaluate 点击
+                            if (!optionClicked) {
+                                console.log('   🔄 尝试备选点击方式...');
+                                await targetPage.evaluate((text) => {
+                                    const selectors = ['[role="option"]', 'li[data-value]', '.MuiMenuItem-root', 'ul[role="listbox"] li'];
+                                    for (const sel of selectors) {
+                                        const els = document.querySelectorAll(sel);
+                                        for (const el of els) {
+                                            if (el.textContent?.trim() === text) {
+                                                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                                                el.click();
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }, chosen.text);
+                            }
+                            await sleep(800);
+
+                            // 等待 Messenger Account 输入框变为可输入
+                            console.log('   ⏳ 等待 Messenger Account 输入框变为可输入...');
+                            for (let i = 0; i < 10; i++) {
+                                const disabled = await targetPage.$eval('#text-field-messengerAccount', el => el.disabled);
+                                if (!disabled) {
+                                    console.log(`   ✅ 输入框已可输入`);
+                                    break;
+                                }
+                                await sleep(500);
+                            }
+
+                            // 生成随机账号
+                            const format = MESSENGER_FORMATS[chosen.text];
+                            if (!format) {
+                                console.warn(`   ⚠️  未找到 "${chosen.text}" 的格式配置，使用默认格式`);
+                            }
+                            const account = generateRandomAccount(format?.format || 'default');
+                            console.log(`   📝 生成 ${chosen.text} 账号: "${account}"`);
+
+                            // 输入账号
+                            await targetPage.click('#text-field-messengerAccount');
+                            await targetPage.type('#text-field-messengerAccount', account, { delay: 50 });
                             await sleep(500);
+
+                            // 验证
+                            const actualValue = await targetPage.$eval('#text-field-messengerAccount', el => el.value);
+                            console.log(`   ✅ 实际输入: "${actualValue}"${actualValue === account ? ' ✔' : ' ✗'}`);
                         }
-
-                        // 生成随机账号
-                        const format = MESSENGER_FORMATS[chosen.text];
-                        const account = generateRandomAccount(format.format);
-                        console.log(`   📝 生成 ${chosen.text} 账号: "${account}"`);
-
-                        // 输入账号
-                        await targetPage.click('#text-field-messengerAccount');
-                        await targetPage.type('#text-field-messengerAccount', account, { delay: 50 });
-                        await sleep(500);
-
-                        // 验证
-                        const actualValue = await targetPage.$eval('#text-field-messengerAccount', el => el.value);
-                        console.log(`   ✅ 实际输入: "${actualValue}"${actualValue === account ? ' ✔' : ' ✗'}`);
 
                         // 步骤 7: 国家下拉框选中 "United States"
                         console.log('\n🌍 步骤 7: 国家下拉框选中 "United States"...');
 
+                        // 通过 DOM 结构找到 Country 的 MUI Autocomplete input
+                        const countryInputSelector = await targetPage.evaluate(() => {
+                            // 先 dump 所有 label 和 input 信息，方便调试
+                            const debugInfo = [];
+                            const labels = document.querySelectorAll('label');
+                            labels.forEach((l, i) => {
+                                const text = (l.textContent || '').trim();
+                                const forAttr = l.getAttribute('for');
+                                debugInfo.push(`label[${i}]: "${text}" for="${forAttr || ''}"`);
+                            });
+                            console.log('[DEBUG] All labels:', JSON.stringify(debugInfo));
+
+                            // 方法1: 通过 label 文字找关联的 input（放宽匹配：包含 "country" 不区分大小写）
+                            for (const label of labels) {
+                                const text = (label.textContent || '').trim().toLowerCase();
+                                if (text.includes('country') || text.includes('region') || text === 'country/region') {
+                                    const forAttr = label.getAttribute('for');
+                                    if (forAttr) {
+                                        const input = document.querySelector('#' + CSS.escape(forAttr));
+                                        if (input) {
+                                            console.log('[DEBUG] Found via label for:', forAttr);
+                                            return '#' + CSS.escape(forAttr);
+                                        }
+                                    }
+                                    const nestedInput = label.querySelector('input');
+                                    if (nestedInput?.id) {
+                                        console.log('[DEBUG] Found via nested input:', nestedInput.id);
+                                        return '#' + CSS.escape(nestedInput.id);
+                                    }
+                                }
+                            }
+
+                            // 方法2: 通过 MuiAutocomplete 结构
+                            const autocompletes = document.querySelectorAll('.MuiAutocomplete-root');
+                            console.log('[DEBUG] MuiAutocomplete-root count:', autocompletes.length);
+                            for (const ac of autocompletes) {
+                                const acLabel = ac.querySelector('label');
+                                const labelText = (acLabel?.textContent || '').trim().toLowerCase();
+                                console.log('[DEBUG] Autocomplete label:', labelText);
+                                if (labelText.includes('country') || labelText.includes('region')) {
+                                    const input = ac.querySelector('input');
+                                    if (input?.id) {
+                                        console.log('[DEBUG] Found via MuiAutocomplete input:', input.id);
+                                        return '#' + CSS.escape(input.id);
+                                    }
+                                }
+                            }
+
+                            // 方法3: 通过 placeholder 或 aria-label 找
+                            const inputs = document.querySelectorAll('input');
+                            for (const inp of inputs) {
+                                const ph = (inp.placeholder || '').toLowerCase();
+                                const aria = (inp.getAttribute('aria-label') || '').toLowerCase();
+                                if (ph.includes('country') || aria.includes('country')) {
+                                    if (inp.id) {
+                                        console.log('[DEBUG] Found via placeholder/aria:', inp.id);
+                                        return '#' + CSS.escape(inp.id);
+                                    }
+                                }
+                            }
+
+                            // 方法4: 找所有 autocomplete input，通过父元素中的文字判断
+                            for (const ac of autocompletes) {
+                                const text = (ac.textContent || '').toLowerCase();
+                                if (text.includes('country') || text.includes('united states')) {
+                                    const input = ac.querySelector('input');
+                                    if (input?.id) {
+                                        console.log('[DEBUG] Found via text content:', input.id);
+                                        return '#' + CSS.escape(input.id);
+                                    }
+                                }
+                            }
+
+                            return null;
+                        });
+
+                        if (!countryInputSelector) {
+                            // 兜底：截图并 dump 页面结构帮助排查
+                            await targetPage.screenshot({ path: 'step7-debug-no-country.png', fullPage: true });
+                            console.log('📸 调试截图已保存: step7-debug-no-country.png');
+                            // 再 dump 所有 input 的 id
+                            const allInputs = await targetPage.evaluate(() => {
+                                return Array.from(document.querySelectorAll('input')).map(el => ({
+                                    id: el.id, type: el.type, placeholder: el.placeholder,
+                                    ariaLabel: el.getAttribute('aria-label'),
+                                    name: el.name, autocomplete: el.autocomplete
+                                }));
+                            });
+                            console.log('📋 页面所有 input 元素:', JSON.stringify(allInputs, null, 2));
+                            throw new Error('无法找到 Country 输入框，页面结构可能已变化');
+                        }
+                        console.log(`   🔍 找到国家选择器: ${countryInputSelector}`);
+
                         // MUI Autocomplete: 点击 → 输入 → 选择
-                        await targetPage.click('#_r_c_');
+                        await targetPage.waitForSelector(countryInputSelector, { visible: true, timeout: 10000 });
                         await sleep(500);
-                        await targetPage.type('#_r_c_', 'United', { delay: 100 });
+
+                        // 先尝试普通点击，失败则用 evaluate 直接点击（绕过 headless 的 scrollIntoView 问题）
+                        try {
+                            await targetPage.click(countryInputSelector);
+                        } catch (clickErr) {
+                            console.log(`   ⚠️ 普通点击失败 (${clickErr.message})，改用 evaluate 点击...`);
+                            await targetPage.evaluate((sel) => {
+                                const el = document.querySelector(sel);
+                                if (el) el.click();
+                            }, countryInputSelector);
+                        }
+                        await sleep(500);
+                        await targetPage.type(countryInputSelector, 'United', { delay: 100 });
                         await sleep(1500);
 
                         await targetPage.evaluate(() => {
@@ -1022,7 +1239,7 @@ export async function signupCrawler(task, proxy) {
                         });
                         await sleep(500);
 
-                        const countryValue = await targetPage.$eval('#_r_c_', el => el.value);
+                        const countryValue = await targetPage.$eval(countryInputSelector, el => el.value);
                         console.log(`   ✅ 国家: "${countryValue}"`);
 
                         // 步骤 8: 密码输入框固定输入 "123456789_Chen"
@@ -1212,7 +1429,7 @@ export async function signupCrawler(task, proxy) {
 
                                 // 关闭当前浏览器
                                 console.log('   🔒 关闭当前浏览器...');
-                                await browser.close();
+                                if (!isExternalBrowser) await browser.close();
 
                                 // 启动新浏览器，不挂代理
                                 console.log('   🌐 启动新浏览器（无代理）...');
@@ -1340,7 +1557,7 @@ export async function signupCrawler(task, proxy) {
                                 if (!inputFound) {
                                     console.warn('   ⚠️  未找到邮箱输入框');
                                     await yopmailPage.screenshot({ path: 'step13-yopmail-input-failed.png', fullPage: true });
-                                    await browser.close();
+                                    if (!isExternalBrowser) await browser.close();
                                     return { success: false, retryable: false, error: '未找到 yopmail 邮箱输入框' };
                                 } else {
                                     // 等待邮箱加载
@@ -1439,14 +1656,14 @@ export async function signupCrawler(task, proxy) {
 
                                             // 关闭 yopmail 浏览器
                                             console.log('   🔒 关闭 yopmail 浏览器...');
-                                            await browser.close();
+                                            if (!isExternalBrowser) await browser.close();
 
                                             // 重新启动代理浏览器
                                             console.log('   🌐 启动代理浏览器...');
 
                                             browser = await launch({
                                                 headless: isLinux,
-                                                proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+                                                proxy: proxy.url,
                                                 humanize: true,
                                                 timezone: 'America/New_York',
                                                 locale: 'en-US',
@@ -1516,7 +1733,7 @@ export async function signupCrawler(task, proxy) {
                                             // 步骤 16-17 完成，关闭浏览器并返回
                                             console.log('\n========================================\n');
                                             console.log('✅ Sign Up 爬虫 + 邮件确认 完成！');
-                                            await browser.close();
+                                            if (!isExternalBrowser) await browser.close();
 
 
                                             return (await loginCrawler(task, proxy, null));
@@ -1526,7 +1743,7 @@ export async function signupCrawler(task, proxy) {
                                                 console.log(`   诊断: iframe linkCount=${confirmLink.linkCount}, body="${confirmLink.bodyPreview?.slice(0, 200)}"`);
                                             }
                                             await yopmailPage.screenshot({ path: 'step15-confirm-link-not-found.png', fullPage: true });
-                                            await browser.close();
+                                            if (!isExternalBrowser) await browser.close();
                                             return { success: false, retryable: false, error: '未找到 Confirm email 链接' };
                                         }
                                     } else {
@@ -1535,7 +1752,7 @@ export async function signupCrawler(task, proxy) {
                                         // yopmail 流程未完成，关闭浏览器并返回
                                         console.log('\n========================================\n');
                                         console.log('⚠️  未找到确认邮件');
-                                        await browser.close();
+                                        if (!isExternalBrowser) await browser.close();
                                         return { success: false, retryable: false, error: '未找到确认邮件' };
                                     }
                                 }
@@ -1577,7 +1794,7 @@ export async function signupCrawler(task, proxy) {
                         console.log('\n========================================\n');
                         console.log('✅ Sign Up 爬虫执行完成！');
                         console.log(`🔗 最终页面地址：${targetUrl}`);
-                        await browser.close();
+                        if (!isExternalBrowser) await browser.close();
                         return { success: true };
 
                     } catch (e) {
@@ -1603,7 +1820,7 @@ export async function signupCrawler(task, proxy) {
             console.log('\n========================================\n');
             console.log('✅ Sign Up 爬虫执行完成！');
             console.log(`🔗 最终页面地址：${finalUrl}`);
-            await browser.close();
+            if (!isExternalBrowser) await browser.close();
             return { success: true };
 
         } catch (error) {
@@ -1611,8 +1828,10 @@ export async function signupCrawler(task, proxy) {
 
             // 清理浏览器
             if (browser) {
+                if (!isExternalBrowser && browser) {
                 try { await browser.close(); } catch (_) {}
                 browser = null;
+            }
             }
 
             if (!signupClicked) {
