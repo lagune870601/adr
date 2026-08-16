@@ -2,10 +2,7 @@ import { launch } from 'cloakbrowser/puppeteer';
 import os from 'os';
 import mysql from 'mysql2/promise';
 import { DB_CONFIG } from './shared/db.js';
-import { ResidentProxyManager } from './proxy.js';
 import {loginCrawler} from "./login.js";
-
-const PROXY_API_KEY = '629a2e2ce2532c8c4ad034fbc4f3c8a5';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const isLinux = os.platform() === 'linux';
@@ -1560,13 +1557,6 @@ export async function signupCrawler(task, proxy) {
 
                                             // 重新启动代理浏览器
                                             console.log('   🌐 启动代理浏览器...');
-                                            proxyManager = new ResidentProxyManager({
-                                                apiKey: PROXY_API_KEY,
-                                                country: 'US',
-                                                rotationInterval: 30 * 60 * 1000,
-                                                protocol: 'http',
-                                                verbose: true,
-                                            });
 
                                             browser = await launch({
                                                 headless: isLinux,
