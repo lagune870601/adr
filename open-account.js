@@ -1,14 +1,12 @@
 import { launch } from 'cloakbrowser/puppeteer';
 import os from 'os';
 import mysql from 'mysql2/promise';
-import { ResidentProxyManager } from './proxy.js';
+import { createProxy } from './shared/proxy-utils.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const isLinux = os.platform() === 'linux';
 
 // ==================== 配置常量 ====================
-
-const PROXY_API_KEY = '629a2e2ce2532c8c4ad034fbc4f3c8a5';
 
 const DB_CONFIG = {
     host: '166.0.19.103',
@@ -144,24 +142,7 @@ async function accountCrawler() {
         console.log(`\n🖥️  当前平台: ${platform} (${isLinux ? '无头模式' : '窗口模式'})`);
 
         console.log('🔌 步骤 2: 获取代理...');
-        proxyManager = new ResidentProxyManager({
-            apiKey: PROXY_API_KEY,
-            country: 'US',
-            rotationInterval: 30 * 60 * 1000,
-            protocol: 'http',
-            verbose: true,
-        });
-
-        proxyManager.on('proxy:ready', (proxy) => {
-            console.log(`   ✅ 代理就绪: ${proxy.host}:${proxy.port}`);
-        });
-
-        proxyManager.on('error', ({ error }) => {
-            console.warn(`   ⚠️  代理错误: ${error.message}`);
-        });
-
-        await proxyManager.start();
-        const proxy = await proxyManager.getProxy();
+        const { proxy, manager: proxyManager } = await createProxy({ country: 'US', protocol: 'http' });
         console.log(`   📡 代理地址: ${proxy.host}:${proxy.port}`);
         console.log(`   👤 代理账号: ${proxy.username}`);
 
@@ -173,7 +154,7 @@ async function accountCrawler() {
             humanize: true,
             timezone: 'America/New_York',
             locale: 'en-US',
-            viewport: { width: 1360, height: 768 },
+viewport: { width: 1360, height: 768 },
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',

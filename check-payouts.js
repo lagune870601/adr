@@ -1,12 +1,11 @@
 import { launch } from 'cloakbrowser/puppeteer';
 import os from 'os';
 import mysql from 'mysql2/promise';
-import { ResidentProxyManager } from './proxy.js';
+import { createProxy } from './shared/proxy-utils.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const isLinux = os.platform() === 'linux';
 
-const PROXY_API_KEY = '629a2e2ce2532c8c4ad034fbc4f3c8a5';
 const DB_CONFIG = { host: '166.0.19.103', port: 13307, user: 'root', password: 'root', database: 'ad' };
 const ACCOUNT = 'shangsaal@bibi.biz.st';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
@@ -50,9 +49,7 @@ async function main() {
         if (!cookies?.length) { console.log('No cookies!'); return; }
 
         // 2. Proxy
-        proxyManager = new ResidentProxyManager({ apiKey: PROXY_API_KEY, country: 'US', rotationInterval: 30 * 60 * 1000, protocol: 'http', verbose: false });
-        await proxyManager.start();
-        const proxy = await proxyManager.getProxy();
+        const { proxy, manager: proxyManager } = await createProxy({ country: 'US', protocol: 'http' });
         console.log(`Proxy: ${proxy.host}:${proxy.port}`);
 
         // 3. Launch browser

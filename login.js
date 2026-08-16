@@ -2,15 +2,12 @@ import { launch } from 'cloakbrowser/puppeteer';
 import os from 'os';
 import mysql from 'mysql2/promise';
 import { DB_CONFIG } from './shared/db.js';
-import { ResidentProxyManager } from './proxy.js';
 import {
     sleep,
     applyStealthPatches,
     waitForCloudflareChallenge,
     getLoginIp,
 } from './shared/crawler-utils.js';
-
-const PROXY_API_KEY = '629a2e2ce2532c8c4ad034fbc4f3c8a5';
 
 const isLinux = os.platform() === 'linux';
 
