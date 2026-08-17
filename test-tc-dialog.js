@@ -37,7 +37,7 @@ async function main() {
         // 3. 启动浏览器
         browser = await launch({
             headless: isLinux,
-            proxy: 'http://' + proxy.username + ':' + proxy.password + '@' + proxy.host + ':' + proxy.port,
+            proxy: proxy.url,
             humanize: true,
             timezone: 'America/New_York',
             locale: 'en-US',

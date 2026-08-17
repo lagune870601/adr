@@ -13,7 +13,7 @@
     "advanced": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node advanced.js"
   },
   "dependencies": {
-    "cloakbrowser": "^0.3.31",
+    "cloakbrowser": "^0.5.7",
     "mysql2": "^3.22.5",
     "proxy-seller-user-api": "^1.9.0",
     "puppeteer-core": "^24.0.0"
