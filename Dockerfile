@@ -33,6 +33,7 @@ COPY change-name.js ./
 COPY create-link.js ./
 COPY create-payout.js ./
 COPY payout.js     ./
+COPY update-usdt-address.js     ./
 COPY main.js     ./
 
 # 启动主调度器

@@ -16,7 +16,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'pasadoll@traodoinick.com';
+const DEFAULT_ACCOUNT = 'robertmiller123@mickaben.biz.st';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';

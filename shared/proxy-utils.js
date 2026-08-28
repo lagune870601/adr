@@ -191,9 +191,11 @@ export async function createProxyFromAPI(options = {}) {
 
 // ──────────────────────── 固定代理 ────────────────────────
 
-const FIXED_PROXY_URL = 'socks5://104.233.202.50:7891';
+const FIXED_PROXY_URL = 'socks5://chenchao:chenchao@104.233.202.50:17891';
 const FIXED_PROXY_HOST = '104.233.202.50';
-const FIXED_PROXY_PORT = 7891;
+const FIXED_PROXY_PORT = 17891;
+const FIXED_NAME = "chenchao";
+const FIXED_PWD = "chenchao";
 
 /**
  * 使用固定 SOCKS5 代理（替代 Proxy-Seller API）
@@ -210,8 +212,8 @@ export async function createProxy(_options = {}) {
         url: FIXED_PROXY_URL,
         host: FIXED_PROXY_HOST,
         port: FIXED_PROXY_PORT,
-        username: '',
-        password: '',
+        username: FIXED_NAME,
+        password: FIXED_PWD,
     };
 
     console.log(`   📡 代理地址: ${proxy.host}:${proxy.port} (SOCKS5)`);
