@@ -10,7 +10,10 @@
     "start:xvfb": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome xvfb-run -a node index.js",
     "test": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test.js",
     "verify": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node verify.js",
-    "advanced": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node advanced.js"
+    "advanced": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node advanced.js",
+    "visit": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node redirect-visitor.js",
+    "visit:test": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test-redirect-visitor.js",
+    "form:test": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test-form.js"
   },
   "dependencies": {
     "cloakbrowser": "^0.5.7",
