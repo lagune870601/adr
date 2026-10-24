@@ -14,6 +14,8 @@
  *   6. 路内随机取址，且不与本路上一轮重复
  *   7. 浏览器进程崩溃自动重启，各路自动恢复
  *   8. 打印每次重定向跳转地址
+ *   9. 各路启动错峰 2 秒（第 i 路等待 i*2 秒），避免启动瞬时并发峰值
+ *  10. 每轮随机生成 Windows 桌面 UA（user-agents 包），覆盖浏览器固定 UA
  *
  * 用法:
  *   node adz.js
@@ -21,6 +23,8 @@
  *     --concurrency=<n>      并发路数（默认 5，要求 <= urls 条数）
  *     --dwell-sec=<n>        单轮停留秒数（默认 20）
  *     --headless             强制无头模式
+ *
+ *   也可用环境变量（优先级低于命令行参数）: CONCURRENCY / DWELL_SEC
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -28,6 +32,7 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import UserAgent from 'user-agents';
 import { createProxy } from './shared/proxy-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,6 +57,7 @@ const MAX_REFRESH_RETRIES = 5;       // 出错时刷新当前页的最大重试�
 const DWELL_POLL_STEP_MS = 500;      // 停留期间轮询"是否跨域名跳走"的步长
 const DEFAULT_CONCURRENCY = 5;       // 默认并发路数
 const BROWSER_RETRY_DELAY_MS = 2000; // 浏览器不可用时的等待间隔
+const STAGGER_STEP_MS = 2000;        // 各路启动错峰步长（第 i 路等待 i * 该值）
 
 // ==================== 日志 ====================
 
@@ -64,10 +70,15 @@ function tslog(msg) {
 
 function parseArgs() {
     const args = process.argv.slice(2);
+
+    // 环境变量作为中间优先级（命令行参数 > 环境变量 > 代码默认值）
+    const envDwell = parseFloat(process.env.DWELL_SEC);
+    const envConc = parseInt(process.env.CONCURRENCY, 10);
+
     const params = {
         urlsFile: path.join(__dirname, 'urls.json'),
-        dwellSec: 20,
-        concurrency: DEFAULT_CONCURRENCY,
+        dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 20,
+        concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
 
@@ -133,6 +144,17 @@ function partitionUrls(urls, concurrency) {
         subsets.push(urls.filter((_, idx) => idx % concurrency === i));
     }
     return subsets;
+}
+
+// ==================== 随机 UA ====================
+
+/** 随机生成一个 Windows 桌面 UA 字符串（每轮调用一次，结果各不相同） */
+function randomWindowsUA() {
+    try {
+        return new UserAgent({ platform: 'Win32' }).toString();
+    } catch {
+        return null;
+    }
 }
 
 // ==================== 域名工具 ====================
@@ -338,6 +360,12 @@ async function workerLoop(workerIndex, subset, params) {
     let lastIndex = -1;
     let round = 0;
 
+    // 启动错峰：第 i 路等待 i*2 秒，避免所有路在同一瞬间并发建上下文/导航
+    if (workerIndex > 0) {
+        await sleep(workerIndex * STAGGER_STEP_MS);
+        if (stopping) return;
+    }
+
     while (!stopping) {
         const { index, url } = pickUrl(subset, lastIndex);
         lastIndex = index;
@@ -360,7 +388,10 @@ async function workerLoop(workerIndex, subset, params) {
         }
         if (stopping) break;
 
-        wlog(`🔵 轮次 #${round} 开始访问 → ${url}`);
+        // 每轮随机 Windows UA，用于覆盖浏览器固定 UA
+        const ua = randomWindowsUA();
+        const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
+        wlog(`🔵 轮次 #${round} 开始访问 → ${url}${uaTag}`);
 
         let context = null;
         try {
@@ -368,6 +399,7 @@ async function workerLoop(workerIndex, subset, params) {
             activeContexts.add(context);
 
             const page = await context.newPage();
+            if (ua) await page.setUserAgent(ua).catch(() => {});
             await page.authenticate({ username: proxyRef.username, password: proxyRef.password });
             await page.setCacheEnabled(false).catch(() => {});
             page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);

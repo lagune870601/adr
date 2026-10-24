@@ -19,6 +19,7 @@
     "cloakbrowser": "^0.5.7",
     "mysql2": "^3.22.5",
     "proxy-seller-user-api": "^1.9.0",
-    "puppeteer-core": "^24.0.0"
+    "puppeteer-core": "^24.0.0",
+    "user-agents": "^2.1.223"
   }
 }
