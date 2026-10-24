@@ -1,24 +1,25 @@
 /**
- * adz.js — 连续循环访问地址列表中的页面（域名守卫版）
+ * adz.js — 多路并发循环访问地址列表中的页面（域名守卫版）
  *
- * 基于 redirect-visitor.js，差异如下:
- *   1. 单轮停留时长默认 10 秒（命令 --dwell-sec 可调），不再长时间停留
- *   2. 跨域名守卫：跳转链接的 hostname 与初始地址 hostname 不一致时，
- *      立即关闭当前隐私上下文并开始下一轮（严格 hostname 相等）
- *   3. 移除人机验证表单处理
+ * 模型: 单浏览器 + N 个并发隐私上下文，每路无限循环访问。
  *
- * 保留特性:
- *   1. 复用 open-account.js 的代理（shared/proxy-utils.js 的 createProxy）
- *   2. 省流量模式：不加载 image / stylesheet / font / media 等资源
- *   3. 每轮全新无痕上下文（零缓存、零 cookie）
- *   4. 从 urls.json 随机取址，且不与上一轮重复
- *   5. 打印每次重定向跳转地址
+ * 特性:
+ *   1. --concurrency 路并发，每路一个隐私上下文，各自无限循环
+ *   2. 地址按取模分区隔离：第 i 路只访问 idx % concurrency === i 的子集
+ *      （启动前校验 urls.length >= concurrency，不足直接报错）
+ *   3. 跨域名守卫：跳转链接的 hostname 与初始地址 hostname 不一致时，
+ *      中止导航并立即关闭当前隐私上下文（严格 hostname 相等）
+ *   4. 每轮全新无痕上下文（零缓存、零 cookie），访问完即关闭
+ *   5. 省流量模式：不加载 image / stylesheet / font / media / script 等资源
+ *   6. 路内随机取址，且不与本路上一轮重复
+ *   7. 浏览器进程崩溃自动重启，各路自动恢复
+ *   8. 打印每次重定向跳转地址
  *
  * 用法:
  *   node adz.js
  *     --urls=./urls.json     地址列表文件（默认 ./urls.json）
- *     --dwell-sec=<n>        单轮停留秒数（默认 10）
- *     --rounds=<n>           循环轮数（默认 0 = 无限）
+ *     --concurrency=<n>      并发路数（默认 5，要求 <= urls 条数）
+ *     --dwell-sec=<n>        单轮停留秒数（默认 20）
  *     --headless             强制无头模式
  */
 
@@ -31,7 +32,6 @@ import { createProxy } from './shared/proxy-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-// const isLinux = os.platform() === 'linux';
 const isLinux = true;
 
 // ==================== 配置常量 ====================
@@ -43,13 +43,15 @@ const BLOCKED_RESOURCE_TYPES = [
     'media',
     'texttrack',
     'manifest',
-    'script'
+    'script',
 ];
 
 const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_REFRESH_RETRIES = 5;       // 出错时刷新当前页的最大重试次数
 const DWELL_POLL_STEP_MS = 500;      // 停留期间轮询"是否跨域名跳走"的步长
+const DEFAULT_CONCURRENCY = 5;       // 默认并发路数
+const BROWSER_RETRY_DELAY_MS = 2000; // 浏览器不可用时的等待间隔
 
 // ==================== 日志 ====================
 
@@ -65,7 +67,7 @@ function parseArgs() {
     const params = {
         urlsFile: path.join(__dirname, 'urls.json'),
         dwellSec: 20,
-        rounds: 0,
+        concurrency: DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
 
@@ -75,8 +77,9 @@ function parseArgs() {
         } else if (arg.startsWith('--dwell-sec=')) {
             const v = parseFloat(arg.slice('--dwell-sec='.length));
             if (Number.isFinite(v) && v > 0) params.dwellSec = v;
-        } else if (arg.startsWith('--rounds=')) {
-            params.rounds = parseInt(arg.slice('--rounds='.length), 10);
+        } else if (arg.startsWith('--concurrency=')) {
+            const v = parseInt(arg.slice('--concurrency='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.concurrency = v;
         } else if (arg === '--headless') {
             params.headless = true;
         }
@@ -109,8 +112,8 @@ function loadUrls(file) {
 }
 
 /**
- * 随机取址，且下标不与上一轮相同。
- * 列表只有 1 条时只能沿用。
+ * 在（子集）列表内随机取址，且下标不与上一次相同。
+ * 子集只有 1 条时只能沿用。
  */
 function pickUrl(urls, lastIndex) {
     if (urls.length === 1) {
@@ -121,6 +124,15 @@ function pickUrl(urls, lastIndex) {
         idx = Math.floor(Math.random() * urls.length);
     } while (idx === lastIndex);
     return { index: idx, url: urls[idx] };
+}
+
+/** 按取模把整表拆分为 concurrency 个子集，第 i 路取 idx % concurrency === i */
+function partitionUrls(urls, concurrency) {
+    const subsets = [];
+    for (let i = 0; i < concurrency; i++) {
+        subsets.push(urls.filter((_, idx) => idx % concurrency === i));
+    }
+    return subsets;
 }
 
 // ==================== 域名工具 ====================
@@ -168,12 +180,12 @@ function setupRequestHandler(page, roundState) {
                     if (host && roundState.initialHost && host !== roundState.initialHost) {
                         if (!roundState.domainMismatch) {
                             roundState.domainMismatch = true;
-                            tslog(`   ⛔ 跨域名跳转（${host} ≠ ${roundState.initialHost}），中止导航并关闭隐私页`);
+                            roundState.log(`   ⛔ 跨域名跳转（${host} ≠ ${roundState.initialHost}），中止导航并关闭隐私页`);
                         }
                         req.abort().catch(() => {});
                         return;
                     }
-                    tslog(`   ↪️  跳转 ${roundState.redirects} → ${u}`);
+                    roundState.log(`   ↪️  跳转 ${roundState.redirects} → ${u}`);
                 }
             }
             req.continue().catch(() => {});
@@ -230,10 +242,10 @@ async function navigateWithRetry(page, url, roundState) {
                 try { cur = page.url(); } catch { cur = ''; }
                 const recoverable = cur && cur !== 'about:blank' && !cur.startsWith('chrome-error://');
                 if (recoverable) {
-                    tslog(`   🔁 加载失败，刷新当前页 第 ${attempt} 次`);
+                    roundState.log(`   🔁 加载失败，刷新当前页 第 ${attempt} 次`);
                     await tryReload(page);
                 } else {
-                    tslog(`   🔁 加载失败，重新访问初始地址 第 ${attempt} 次`);
+                    roundState.log(`   🔁 加载失败，重新访问初始地址 第 ${attempt} 次`);
                     await tryLoad(page, url);
                 }
             }
@@ -241,7 +253,7 @@ async function navigateWithRetry(page, url, roundState) {
         } catch (e) {
             if (roundState.domainMismatch) return false;
             if (attempt === MAX_REFRESH_RETRIES) {
-                tslog(`   ❌ 重试 ${MAX_REFRESH_RETRIES} 次仍失败: ${e.message.slice(0, 60)}`);
+                roundState.log(`   ❌ 重试 ${MAX_REFRESH_RETRIES} 次仍失败: ${e.message.slice(0, 60)}`);
                 return false;
             }
             await sleep(1000);
@@ -262,57 +274,77 @@ async function createFreshContext(browser) {
     throw new Error('当前浏览器不支持创建无痕上下文');
 }
 
-// ==================== 主流程 ====================
+// ==================== 浏览器生命周期（崩溃自愈）====================
 
 let browser = null;
+let launchPromise = null;
 let proxyManager = null;
+let proxyRef = null;
+let headlessFlag = isLinux;
 const activeContexts = new Set();
 let stopping = false;
 
-async function run() {
-    const params = parseArgs();
-    const urls = loadUrls(params.urlsFile);
+/**
+ * 确保有一个可用的浏览器；进程崩溃/断开后自动重建。
+ * 并发调用共享同一次 launch，避免多路同时重建。
+ * @returns {Promise<object|null>} 可用浏览器，重建失败返回 null
+ */
+async function ensureBrowser() {
+    if (browser && browser.isConnected()) return browser;
 
-    console.log('🚀 启动 CloakBrowser (adz 访问器)...');
-    console.log(`📋 地址列表: ${urls.length} 条 | 文件: ${params.urlsFile}`);
-    console.log(`⏱️  单轮停留: ${params.dwellSec.toFixed(0)} 秒`);
-    console.log(`🔁 循环轮数: ${params.rounds === 0 ? '无限' : params.rounds}`);
-    console.log(`🛡️  跨域名守卫: 开启（严格 hostname 相等）`);
-    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
+    if (!launchPromise) {
+        launchPromise = (async () => {
+            try {
+                const b = await launch({
+                    headless: headlessFlag,
+                    proxy: proxyRef.url,
+                    humanize: true,
+                    timezone: 'America/New_York',
+                    locale: 'en-US',
+                    viewport: { width: 1360, height: 768 },
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-gpu',
+                    ],
+                });
+                b.on('disconnected', () => {
+                    if (browser === b) {
+                        browser = null;
+                        tslog('⚠️  浏览器已断开，将在下一轮自动重建');
+                    }
+                });
+                browser = b;
+                tslog('🧩 浏览器已就绪');
+                return b;
+            } catch (e) {
+                tslog(`❌ 浏览器启动失败: ${e.message.slice(0, 80)}`);
+                return null;
+            } finally {
+                launchPromise = null;
+            }
+        })();
+    }
+    return launchPromise;
+}
 
-    // 代理（与 open-account.js 一致）
-    const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
-    proxyManager = manager;
-    console.log(`📡 代理地址: ${proxy.host}:${proxy.port}\n`);
+// ==================== 单路工作循环 ====================
 
-    // 浏览器只启动一次，后续每轮复用
-    browser = await launch({
-        headless: params.headless,
-        proxy: proxy.url,
-        humanize: true,
-        timezone: 'America/New_York',
-        locale: 'en-US',
-        viewport: { width: 1360, height: 768 },
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--disable-gpu',
-        ],
-    });
-
+async function workerLoop(workerIndex, subset, params) {
+    const tag = `[W${workerIndex + 1}]`;
+    const wlog = (m) => tslog(`${tag} ${m}`);
     let lastIndex = -1;
     let round = 0;
 
     while (!stopping) {
-        if (params.rounds > 0 && round >= params.rounds) break;
+        const { index, url } = pickUrl(subset, lastIndex);
+        lastIndex = index;
         round += 1;
 
-        const { index, url } = pickUrl(urls, lastIndex);
-        lastIndex = index;
-
         const roundState = {
+            log: wlog,
             initialUrl: url,
             initialHost: hostnameOf(url),
             hops: 0,
@@ -321,20 +353,28 @@ async function run() {
             loadFailed: false,
         };
 
-        tslog(`🔵 轮次 #${round} 开始访问 → ${url}`);
+        const br = await ensureBrowser();
+        if (!br) {
+            await sleep(BROWSER_RETRY_DELAY_MS);
+            continue;
+        }
+        if (stopping) break;
 
-        const context = await createFreshContext(browser);
-        activeContexts.add(context);
+        wlog(`🔵 轮次 #${round} 开始访问 → ${url}`);
 
+        let context = null;
         try {
+            context = await createFreshContext(br);
+            activeContexts.add(context);
+
             const page = await context.newPage();
-            await page.authenticate({ username: proxy.username, password: proxy.password });
+            await page.authenticate({ username: proxyRef.username, password: proxyRef.password });
             await page.setCacheEnabled(false).catch(() => {});
             page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
             page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
             await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
 
-            await setupRequestHandler(page, roundState);
+            setupRequestHandler(page, roundState);
 
             // 关闭意外弹出的新标签/窗口，只在原标签工作
             context.on('targetcreated', async (target) => {
@@ -342,7 +382,7 @@ async function run() {
                 try {
                     const tpage = await target.page();
                     if (tpage && tpage !== page) {
-                        tslog('   🪟 关闭意外弹窗/新标签');
+                        wlog('   🪟 关闭意外弹窗/新标签');
                         await tpage.close().catch(() => {});
                     }
                 } catch { /* ignore */ }
@@ -360,38 +400,76 @@ async function run() {
             }
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-            const domainTag = roundState.domainMismatch ? 'changed' : 'same';
-            tslog(`✅ 轮次 #${round} 结束（停留 ${elapsed}s）| 跳转 ${roundState.redirects} 次 | 加载 ${roundState.loadFailed ? '失败' : '成功'} | 域名 ${roundState.domainMismatch ? '跨域' : '一致'}`);
-            console.log(`ROUND_SUMMARY round=${round} redirects=${roundState.redirects} error=${roundState.loadFailed ? 'yes' : 'no'} domain=${domainTag}`);
+            wlog(`✅ 轮次 #${round} 结束（停留 ${elapsed}s）| 跳转 ${roundState.redirects} 次 | 加载 ${roundState.loadFailed ? '失败' : '成功'} | 域名 ${roundState.domainMismatch ? '跨域' : '一致'}`);
+            console.log(`ROUND_SUMMARY worker=${workerIndex + 1} round=${round} redirects=${roundState.redirects} error=${roundState.loadFailed ? 'yes' : 'no'} domain=${roundState.domainMismatch ? 'changed' : 'same'}`);
 
         } catch (e) {
-            tslog(`❌ 轮次 #${round} 异常: ${e.message}`);
+            wlog(`❌ 轮次 #${round} 异常: ${e.message}`);
         } finally {
-            activeContexts.delete(context);
-            await context.close().catch(() => {});
+            if (context) {
+                activeContexts.delete(context);
+                await context.close().catch(() => {});
+            }
         }
     }
+}
 
-    tslog('🏁 所有轮次已完成，正在收尾...');
+// ==================== 主流程 ====================
+
+async function run() {
+    const params = parseArgs();
+    const urls = loadUrls(params.urlsFile);
+
+    if (urls.length < params.concurrency) {
+        throw new Error(
+            `地址列表不足: ${params.urlsFile} 仅 ${urls.length} 条，但并发数为 ${params.concurrency}；` +
+            `要求 urls.length >= concurrency`
+        );
+    }
+
+    headlessFlag = params.headless;
+
+    console.log('🚀 启动 CloakBrowser (adz 访问器 · 并发版)...');
+    console.log(`📋 地址列表: ${urls.length} 条 | 文件: ${params.urlsFile}`);
+    console.log(`🧵 并发路数: ${params.concurrency}`);
+    console.log(`⏱️  单轮停留: ${params.dwellSec.toFixed(0)} 秒`);
+    console.log(`🛡️  跨域名守卫: 开启（严格 hostname 相等）`);
+    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
+
+    // 代理（与 open-account.js 一致）
+    const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
+    proxyManager = manager;
+    proxyRef = proxy;
+    console.log(`📡 代理地址: ${proxy.host}:${proxy.port}（${params.concurrency} 路共用）\n`);
+
+    await ensureBrowser();
+
+    const subsets = partitionUrls(urls, params.concurrency);
+    subsets.forEach((s, i) => console.log(`   [W${i + 1}] 子集 ${s.length} 条`));
+    console.log('');
+
+    const workers = subsets.map((subset, i) => workerLoop(i, subset, params));
+    await Promise.all(workers);
+
+    tslog('🏁 已停止，正在收尾...');
 }
 
 async function cleanup() {
+    stopping = true;
     for (const c of activeContexts) {
         await c.close().catch(() => {});
     }
     activeContexts.clear();
     if (browser) await browser.close().catch(() => {});
+    browser = null;
     if (proxyManager) proxyManager.destroy();
 }
 
-process.on('SIGINT', async () => {
+process.on('SIGINT', () => {
     tslog('👋 收到退出信号，正在关闭浏览器...');
-    stopping = true;
-    try {
-        await cleanup();
-    } finally {
-        process.exit(0);
-    }
+    // 有界收尾：最多等 5 秒。某个 context/browser 的 close 可能卡住，
+    // 不能让 finally 里的 process.exit 永远等不到。
+    Promise.race([cleanup(), sleep(5000)]).finally(() => process.exit(0));
 });
 
 const isMain = process.argv[1] &&
