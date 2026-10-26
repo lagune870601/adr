@@ -37,7 +37,7 @@ import { createProxy } from './shared/proxy-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-const isLinux = true;
+const isLinux = false;
 
 // ==================== 配置常量 ====================
 
@@ -55,7 +55,7 @@ const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_REFRESH_RETRIES = 5;       // 出错时刷新当前页的最大重试次数
 const DWELL_POLL_STEP_MS = 500;      // 停留期间轮询"是否跨域名跳走"的步长
-const DEFAULT_CONCURRENCY = 5;       // 默认并发路数
+const DEFAULT_CONCURRENCY = 1;       // 默认并发路数
 const BROWSER_RETRY_DELAY_MS = 2000; // 浏览器不可用时的等待间隔
 const STAGGER_STEP_MS = 2000;        // 各路启动错峰步长（第 i 路等待 i * 该值）
 
