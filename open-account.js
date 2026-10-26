@@ -16,7 +16,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'robertmiller123@mickaben.biz.st';
+const DEFAULT_ACCOUNT = 'leonPatterson@mcdomaine.fr.nf';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
@@ -144,7 +144,7 @@ async function accountCrawler() {
         console.log('🔌 步骤 2: 获取代理...');
         const { proxy, manager: proxyManager } = await createProxy({ country: 'US', protocol: 'http' });
         console.log(`   📡 代理地址: ${proxy.host}:${proxy.port}`);
-        console.log(`   👤 代理账号: ${proxy.username}`);
+        console.log(`   👤 代理账号: ${proxy.username}:${proxy.url}`);
 
         // 步骤 3: 启动 CloakBrowser
         console.log('\n🌐 步骤 3: 启动 CloakBrowser...');

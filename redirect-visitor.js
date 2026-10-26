@@ -27,7 +27,8 @@ import { createProxy } from './shared/proxy-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-const isLinux = os.platform() === 'linux';
+// const isLinux = os.platform() === 'linux';
+const isLinux = true;
 
 // ==================== 配置常量 ====================
 
@@ -38,6 +39,7 @@ const BLOCKED_RESOURCE_TYPES = [
     'media',
     'texttrack',
     'manifest',
+    'script'
 ];
 
 const NAV_TIMEOUT_MS = 60000;
