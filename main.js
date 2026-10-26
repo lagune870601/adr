@@ -18,16 +18,17 @@ const POLL_INTERVAL = 10000;  // 无任务时轮询间隔（毫秒）
 
 // 任务类型 → 爬虫函数映射
 const CRAWLER_DISPATCH = {
-    'REGISTER': signupCrawler,
+    //'REGISTER': signupCrawler,
+    //'REGISTER_ADZ': signupAdzCrawler,
+    //'LOGIN': loginCrawler,
+    //'ACCOUNT': accountCrawler,
+    'PAYOUT': payoutCrawler,
+    'CREATE_API_TOKEN': createApiTokenCrawler,
+    'CREATE_LINK': createLinkCrawler,
+    'CREATE_PAYOUT': createPayoutCrawler,
+    'CHANGE_NAME': changeNameCrawler,
+    'UPDATE_USDT_ADDRESS': updateUsdtAddressCrawler,
     'REGISTER_ADZ': signupAdzCrawler,
-    'LOGIN': loginCrawler,
-    // 'ACCOUNT': accountCrawler,
-    // 'PAYOUT': payoutCrawler,
-    //'CREATE_API_TOKEN': createApiTokenCrawler,
-    //'CREATE_LINK': createLinkCrawler,
-    //'CREATE_PAYOUT': createPayoutCrawler,
-    //'CHANGE_NAME': changeNameCrawler,
-    //'UPDATE_USDT_ADDRESS': updateUsdtAddressCrawler,
 };
 
 /**
