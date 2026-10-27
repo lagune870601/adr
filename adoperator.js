@@ -67,6 +67,10 @@ const ROUND_WAIT_MS = 5000;          // 每轮关闭上下文后，进入下一�
 const ALLOWED_REDIRECT_HOSTS = new Set([
     'marth.qualoportabl.com',
     'mgcrspub.jisijri.com',
+    'www.pumpkingonsky.study',
+    'www.passingcars.wiki',
+    'www.ubelivablestrange.study',
+    'ext.rotkex.com'
 ]);
 
 // ==================== 日志 ====================

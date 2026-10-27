@@ -191,9 +191,9 @@ export async function createProxyFromAPI(options = {}) {
 
 // ──────────────────────── 固定代理 ────────────────────────
 
-const FIXED_PROXY_URL = 'socks5://chenchao:chenchao@104.233.202.50:17893';
+const FIXED_PROXY_URL = 'socks5://chenchao:chenchao@104.233.202.50:17891';
 const FIXED_PROXY_HOST = '104.233.202.50';
-const FIXED_PROXY_PORT = 17893;
+const FIXED_PROXY_PORT = 17891;
 const FIXED_NAME = "chenchao";
 const FIXED_PWD = "chenchao";
 
