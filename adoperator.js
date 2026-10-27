@@ -1,5 +1,5 @@
 /**
- * adz.js — 多路并发循环访问地址列表中的页面（域名守卫版）
+ * adoperator.js — 多路并发循环访问地址列表中的页面（域名守卫版）
  *
  * 模型: 单浏览器 + N 个并发隐私上下文，每路无限循环访问。
  *
@@ -17,13 +17,15 @@
  *   9. 各路启动错峰 2 秒（第 i 路等待 i*2 秒），避免启动瞬时并发峰值
  *  10. 每轮随机生成 Windows 桌面 UA（user-agents 包），覆盖浏览器固定 UA
  *  11. 每轮关闭隐私上下文后，固定等待 5 秒再进入下一轮
+ *  12. --test 测试模式：固定单路单轮，隐私窗口保持打开供人工操作，关闭窗口后自动退出
  *
  * 用法:
- *   node adz.js
+ *   node adoperator.js
  *     --urls=./urls.json     地址列表文件（默认 ./urls.json）
  *     --concurrency=<n>      并发路数（默认 5，要求 <= urls 条数）
  *     --dwell-sec=<n>        单轮停留秒数（默认 20）
  *     --headless             强制无头模式
+ *     --test                 测试模式（固定单路单轮，隐私窗口不自动关闭）
  *
  *   也可用环境变量（优先级低于命令行参数）: CONCURRENCY / DWELL_SEC
  */
@@ -82,6 +84,7 @@ function parseArgs() {
         dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 20,
         concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
+        test: false,
     };
 
     for (const arg of args) {
@@ -95,7 +98,15 @@ function parseArgs() {
             if (Number.isInteger(v) && v > 0) params.concurrency = v;
         } else if (arg === '--headless') {
             params.headless = true;
+        } else if (arg === '--test') {
+            params.test = true;
         }
+    }
+
+    // 测试模式固定单路、必须有窗口供人工操作
+    if (params.test) {
+        params.concurrency = 1;
+        params.headless = false;
     }
 
     return params;
@@ -298,6 +309,33 @@ async function createFreshContext(browser) {
     throw new Error('当前浏览器不支持创建无痕上下文');
 }
 
+// ==================== 测试模式：等待人工关闭窗口 ====================
+
+/** 等待页面/隐私上下文被人工关闭；事件不触发时用轮询兜底 */
+function waitForContextClosed(page, context) {
+    return new Promise((resolve) => {
+        let done = false;
+        let timer = null;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            if (timer) clearInterval(timer);
+            resolve();
+        };
+        try { page.once('close', finish); } catch { /* ignore */ }
+        try { context.once('closed', finish); } catch { /* ignore */ }
+        timer = setInterval(() => {
+            try {
+                const pageClosed = typeof page.isClosed === 'function' && page.isClosed();
+                const ctxClosed = typeof context.isClosed === 'function' && context.isClosed();
+                if (pageClosed || ctxClosed) finish();
+            } catch {
+                finish();
+            }
+        }, 1000);
+    });
+}
+
 // ==================== 浏览器生命周期（崩溃自愈）====================
 
 let browser = null;
@@ -396,11 +434,12 @@ async function workerLoop(workerIndex, subset, params) {
         wlog(`🔵 轮次 #${round} 开始访问 → ${url}${uaTag}`);
 
         let context = null;
+        let page = null;
         try {
             context = await createFreshContext(br);
             activeContexts.add(context);
 
-            const page = await context.newPage();
+            page = await context.newPage();
             if (ua) await page.setUserAgent(ua).catch(() => {});
             await page.authenticate({ username: proxyRef.username, password: proxyRef.password });
             await page.setCacheEnabled(false).catch(() => {});
@@ -440,10 +479,21 @@ async function workerLoop(workerIndex, subset, params) {
         } catch (e) {
             wlog(`❌ 轮次 #${round} 异常: ${e.message}`);
         } finally {
-            if (context) {
+            // 测试模式保留隐私窗口，供人工操作
+            if (context && !params.test) {
                 activeContexts.delete(context);
                 await context.close().catch(() => {});
             }
+        }
+
+        // 测试模式：等待人工关闭窗口后结束
+        if (params.test) {
+            if (context && page) {
+                wlog('🧪 测试模式：窗口保持打开，请人工操作；关闭窗口后程序退出');
+                await waitForContextClosed(page, context);
+                wlog('🧪 测试窗口已关闭，测试结束');
+            }
+            return;
         }
 
         // 每轮在上下文关闭后固定等待，避免连续发起下一轮
@@ -474,7 +524,11 @@ async function run() {
     console.log(`🧵 并发路数: ${params.concurrency}`);
     console.log(`⏱️  单轮停留: ${params.dwellSec.toFixed(0)} 秒`);
     console.log(`🛡️  跨域名守卫: 开启（严格 hostname 相等）`);
-    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
+    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
+    if (params.test) {
+        console.log('🧪 测试模式: 单路单轮，隐私窗口保持打开，关闭窗口后自动退出（--concurrency/--headless 已忽略）');
+    }
+    console.log('');
 
     // 代理（与 open-account.js 一致）
     const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
