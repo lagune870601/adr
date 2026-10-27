@@ -7,10 +7,9 @@
  *   1. --concurrency 路并发，每路一个隐私上下文，各自无限循环
  *   2. 地址按取模分区隔离：第 i 路只访问 idx % concurrency === i 的子集
  *      （启动前校验 urls.length >= concurrency，不足直接报错）
- *   3. 跨域名守卫：跳转链接的 hostname 与初始地址不一致且不在白名单时，
- *      中止导航并立即关闭当前隐私上下文（严格 hostname 相等）
+ *   3. 不拦截跨域跳转：完整打印跳转链，不中止导航
  *   4. 每轮全新无痕上下文（零缓存、零 cookie），访问完即关闭
- *   5. 省流量模式：不加载 image / stylesheet / font / media / script 等资源
+ *   5. 不拦截资源：正常加载 image / stylesheet / font / media / script 等
  *   6. 路内随机取址，且不与本路上一轮重复
  *   7. 浏览器进程崩溃自动重启，各路自动恢复
  *   8. 打印每次重定向跳转地址
@@ -44,34 +43,14 @@ const isLinux = false;
 
 // ==================== 配置常量 ====================
 
-const BLOCKED_RESOURCE_TYPES = [
-    'image',
-    'stylesheet',
-    'font',
-    'media',
-    'texttrack',
-    'manifest',
-    'script',
-];
-
 const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_REFRESH_RETRIES = 5;       // 出错时刷新当前页的最大重试次数
-const DWELL_POLL_STEP_MS = 500;      // 停留期间轮询"是否跨域名跳走"的步长
+const DWELL_POLL_STEP_MS = 500;      // 停留期间的轮询步长
 const DEFAULT_CONCURRENCY = 1;       // 默认并发路数
 const BROWSER_RETRY_DELAY_MS = 2000; // 浏览器不可用时的等待间隔
 const STAGGER_STEP_MS = 2000;        // 各路启动错峰步长（第 i 路等待 i * 该值）
 const ROUND_WAIT_MS = 5000;          // 每轮关闭上下文后，进入下一轮前的固定等待
-
-// 允许跳转的跨域 hostname（逐跳校验；初始地址本身始终放行）
-const ALLOWED_REDIRECT_HOSTS = new Set([
-    'marth.qualoportabl.com',
-    'mgcrspub.jisijri.com',
-    'www.pumpkingonsky.study',
-    'www.passingcars.wiki',
-    'www.ubelivablestrange.study',
-    'ext.rotkex.com'
-]);
 
 // ==================== 日志 ====================
 
@@ -180,27 +159,10 @@ function randomWindowsUA() {
     }
 }
 
-// ==================== 域名工具 ====================
-
-/** 取 URL 的 hostname（已自动小写）；非法 URL 返回 null */
-function hostnameOf(u) {
-    try {
-        return new URL(u).hostname || null;
-    } catch {
-        return null;
-    }
-}
-
-// ==================== 请求拦截：省流量 + 跳转日志 + 跨域名守卫 ====================
+// ==================== 请求观察：打印跳转日志（不拦截） ====================
 
 /**
- * 统一的请求处理器（必须是唯一监听 request 的处理器）：
- *   - document（主 frame）：作为导航跳转链的一环，打印跳转地址；
- *     跳转域名与初始域名严格不一致时，abort 该请求以立即中止导航并置 domainMismatch。
- *   - 其余资源：省流量拦截（不加载 image/stylesheet/font/media 等）。
- *
- * 为什么必须合并：puppeteer 中同一个请求只能被 continue/abort 一次，
- * 若省流量拦截先 continue 了 document 请求，后续守卫就再也无法 abort。
+ * 仅观察主 frame 的 document 请求并打印跳转地址，所有请求一律放行。
  *
  * 关键点：HTTP 3xx 的每一跳都会重新发起一次 document 请求，
  * 但 framenavigated 只在最终文档提交时触发一次，会漏掉中间跳。
@@ -220,31 +182,12 @@ function setupRequestHandler(page, roundState) {
 
                 // 第 1 个 document 请求即初始访问地址，已在"开始访问"行打印，避免重复
                 if (roundState.hops > 1) {
-                    // 打印前：比对跳转域名与初始域名
-                    const host = hostnameOf(u);
-                    if (host && roundState.initialHost && host !== roundState.initialHost) {
-                        if (!ALLOWED_REDIRECT_HOSTS.has(host)) {
-                            if (!roundState.domainMismatch) {
-                                roundState.domainMismatch = true;
-                                roundState.log(`   ⛔ 跨域名跳转（${host} ≠ ${roundState.initialHost}），中止导航并关闭隐私页`);
-                            }
-                            req.abort().catch(() => {});
-                            return;
-                        }
-                        roundState.log(`   ✔️  白名单跨域放行（${host}）`);
-                    }
                     roundState.log(`   ↪️  跳转 ${roundState.redirects} → ${u}`);
                 }
             }
-            req.continue().catch(() => {});
-            return;
         }
 
-        if (BLOCKED_RESOURCE_TYPES.includes(type)) {
-            req.abort().catch(() => {});
-        } else {
-            req.continue().catch(() => {});
-        }
+        req.continue().catch(() => {});
     });
 }
 
@@ -274,14 +217,10 @@ async function tryReload(page) {
 /**
  * 访问地址；出错时优先刷新当前页（问题可能出在重定向后的页面），
  * 当前页已是错误/空白页则重新访问初始地址。最多尝试 MAX_REFRESH_RETRIES 次。
- *
- * 若本轮已因跨域名被守卫中止（roundState.domainMismatch），立即返回失败，
- * 不再重试——否则会在已关闭/已中止的导航上反复刷新。
  * @returns {Promise<boolean>} 是否最终加载成功
  */
 async function navigateWithRetry(page, url, roundState) {
     for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
-        if (roundState.domainMismatch) return false;
         try {
             if (attempt === 0) {
                 await tryLoad(page, url);
@@ -299,7 +238,6 @@ async function navigateWithRetry(page, url, roundState) {
             }
             return true;
         } catch (e) {
-            if (roundState.domainMismatch) return false;
             if (attempt === MAX_REFRESH_RETRIES) {
                 roundState.log(`   ❌ 重试 ${MAX_REFRESH_RETRIES} 次仍失败: ${e.message.slice(0, 60)}`);
                 return false;
@@ -426,11 +364,8 @@ async function workerLoop(workerIndex, subset, params) {
 
         const roundState = {
             log: wlog,
-            initialUrl: url,
-            initialHost: hostnameOf(url),
             hops: 0,
             redirects: 0,
-            domainMismatch: false,
             loadFailed: false,
         };
 
@@ -477,17 +412,17 @@ async function workerLoop(workerIndex, subset, params) {
             const startTime = Date.now();
             const dwellEnd = startTime + params.dwellSec * 1000;
 
-            // 导航（含出错刷新重试；跨域名被守卫中止时不记为加载失败）
-            roundState.loadFailed = !(await navigateWithRetry(page, url, roundState)) && !roundState.domainMismatch;
+            // 导航（含出错刷新重试）
+            roundState.loadFailed = !(await navigateWithRetry(page, url, roundState));
 
-            // 停留期间轮询：跨域名跳走则立即退出，否则停留满 dwellSec
-            while (!stopping && !roundState.domainMismatch && Date.now() < dwellEnd) {
+            // 停留满 dwellSec
+            while (!stopping && Date.now() < dwellEnd) {
                 await sleep(DWELL_POLL_STEP_MS);
             }
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-            wlog(`✅ 轮次 #${round} 结束（停留 ${elapsed}s）| 跳转 ${roundState.redirects} 次 | 加载 ${roundState.loadFailed ? '失败' : '成功'} | 域名 ${roundState.domainMismatch ? '跨域' : '一致'}`);
-            console.log(`ROUND_SUMMARY worker=${workerIndex + 1} round=${round} redirects=${roundState.redirects} error=${roundState.loadFailed ? 'yes' : 'no'} domain=${roundState.domainMismatch ? 'changed' : 'same'}`);
+            wlog(`✅ 轮次 #${round} 结束（停留 ${elapsed}s）| 跳转 ${roundState.redirects} 次 | 加载 ${roundState.loadFailed ? '失败' : '成功'}`);
+            console.log(`ROUND_SUMMARY worker=${workerIndex + 1} round=${round} redirects=${roundState.redirects} error=${roundState.loadFailed ? 'yes' : 'no'} domain=off`);
 
         } catch (e) {
             wlog(`❌ 轮次 #${round} 异常: ${e.message}`);
@@ -536,7 +471,7 @@ async function run() {
     console.log(`📋 地址列表: ${urls.length} 条 | 文件: ${params.urlsFile}`);
     console.log(`🧵 并发路数: ${params.concurrency}`);
     console.log(`⏱️  单轮停留: ${params.dwellSec.toFixed(0)} 秒`);
-    console.log(`🛡️  跨域名守卫: 开启（严格 hostname 相等）`);
+    console.log('🛡️  跨域/资源拦截: 关闭（全部放行）');
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
     if (params.test) {
         console.log('🧪 测试模式: 单路单轮，隐私窗口保持打开，关闭窗口后自动退出（--concurrency/--headless 已忽略）');
