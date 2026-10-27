@@ -7,7 +7,7 @@
  *   1. --concurrency 路并发，每路一个隐私上下文，各自无限循环
  *   2. 地址按取模分区隔离：第 i 路只访问 idx % concurrency === i 的子集
  *      （启动前校验 urls.length >= concurrency，不足直接报错）
- *   3. 跨域名守卫：跳转链接的 hostname 与初始地址 hostname 不一致时，
+ *   3. 跨域名守卫：跳转链接的 hostname 与初始地址不一致且不在白名单时，
  *      中止导航并立即关闭当前隐私上下文（严格 hostname 相等）
  *   4. 每轮全新无痕上下文（零缓存、零 cookie），访问完即关闭
  *   5. 省流量模式：不加载 image / stylesheet / font / media / script 等资源
@@ -62,6 +62,12 @@ const DEFAULT_CONCURRENCY = 1;       // 默认并发路数
 const BROWSER_RETRY_DELAY_MS = 2000; // 浏览器不可用时的等待间隔
 const STAGGER_STEP_MS = 2000;        // 各路启动错峰步长（第 i 路等待 i * 该值）
 const ROUND_WAIT_MS = 5000;          // 每轮关闭上下文后，进入下一轮前的固定等待
+
+// 允许跳转的跨域 hostname（逐跳校验；初始地址本身始终放行）
+const ALLOWED_REDIRECT_HOSTS = new Set([
+    'marth.qualoportabl.com',
+    'mgcrspub.jisijri.com',
+]);
 
 // ==================== 日志 ====================
 
@@ -213,12 +219,15 @@ function setupRequestHandler(page, roundState) {
                     // 打印前：比对跳转域名与初始域名
                     const host = hostnameOf(u);
                     if (host && roundState.initialHost && host !== roundState.initialHost) {
-                        if (!roundState.domainMismatch) {
-                            roundState.domainMismatch = true;
-                            roundState.log(`   ⛔ 跨域名跳转（${host} ≠ ${roundState.initialHost}），中止导航并关闭隐私页`);
+                        if (!ALLOWED_REDIRECT_HOSTS.has(host)) {
+                            if (!roundState.domainMismatch) {
+                                roundState.domainMismatch = true;
+                                roundState.log(`   ⛔ 跨域名跳转（${host} ≠ ${roundState.initialHost}），中止导航并关闭隐私页`);
+                            }
+                            req.abort().catch(() => {});
+                            return;
                         }
-                        req.abort().catch(() => {});
-                        return;
+                        roundState.log(`   ✔️  白名单跨域放行（${host}）`);
                     }
                     roundState.log(`   ↪️  跳转 ${roundState.redirects} → ${u}`);
                 }
