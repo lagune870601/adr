@@ -16,6 +16,7 @@
  *   8. 打印每次重定向跳转地址
  *   9. 各路启动错峰 2 秒（第 i 路等待 i*2 秒），避免启动瞬时并发峰值
  *  10. 每轮随机生成 Windows 桌面 UA（user-agents 包），覆盖浏览器固定 UA
+ *  11. 成功轮次关闭隐私上下文后，固定等待 5 秒再进入下一轮（失败/跨域轮次不等待）
  *
  * 用法:
  *   node adz.js
@@ -58,6 +59,7 @@ const DWELL_POLL_STEP_MS = 500;      // 停留期间轮询"是否跨域名跳走
 const DEFAULT_CONCURRENCY = 1;       // 默认并发路数
 const BROWSER_RETRY_DELAY_MS = 2000; // 浏览器不可用时的等待间隔
 const STAGGER_STEP_MS = 2000;        // 各路启动错峰步长（第 i 路等待 i * 该值）
+const SUCCESS_ROUND_WAIT_MS = 5000;  // 成功轮次关闭上下文后，进入下一轮前的固定等待
 
 // ==================== 日志 ====================
 
@@ -378,7 +380,7 @@ async function workerLoop(workerIndex, subset, params) {
             hops: 0,
             redirects: 0,
             domainMismatch: false,
-            loadFailed: false,
+            loadFailed: true,
         };
 
         const br = await ensureBrowser();
@@ -442,6 +444,12 @@ async function workerLoop(workerIndex, subset, params) {
                 activeContexts.delete(context);
                 await context.close().catch(() => {});
             }
+        }
+
+        // 成功轮次在上下文关闭后固定等待，避免立即发起下一轮
+        if (!roundState.loadFailed && !roundState.domainMismatch && !stopping) {
+            wlog(`⏳ 成功轮次，等待 ${SUCCESS_ROUND_WAIT_MS / 1000} 秒后进入下一轮`);
+            await sleep(SUCCESS_ROUND_WAIT_MS);
         }
     }
 }
