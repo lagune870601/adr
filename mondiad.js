@@ -1,0 +1,352 @@
+/**
+ * mondiad.js — 多路并发循环访问，返回本地空页面并加载 Mondiad 广告脚本
+ *
+ * 用法:
+ *   node mondiad.js --concurrency=1 --dwell-sec=20 [--urls=./mondiad-urls.json] [--headless]
+ */
+
+import { launch } from 'cloakbrowser/puppeteer';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import UserAgent from 'user-agents';
+import { createProxy } from './shared/proxy-utils.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const isLinux = false;
+
+const NAV_TIMEOUT_MS = 60000;
+const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_CONCURRENCY = 1;
+const STAGGER_STEP_MS = 2000;
+const ROUND_WAIT_MS = 5000;
+
+// ==================== 日志 ====================
+
+function tslog(msg) {
+    const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
+    console.log(`[${t}] ${msg}`);
+}
+
+// ==================== 命令行参数 ====================
+
+function parseArgs() {
+    const args = process.argv.slice(2);
+
+    const envDwell = parseFloat(process.env.DWELL_SEC);
+    const envConc = parseInt(process.env.CONCURRENCY, 10);
+
+    const params = {
+        urlsFile: path.join(__dirname, 'mondiad-urls.json'),
+        dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 20,
+        concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
+        headless: isLinux,
+    };
+
+    for (const arg of args) {
+        if (arg.startsWith('--urls=')) {
+            params.urlsFile = arg.slice('--urls='.length);
+        } else if (arg.startsWith('--dwell-sec=')) {
+            const v = parseFloat(arg.slice('--dwell-sec='.length));
+            if (Number.isFinite(v) && v > 0) params.dwellSec = v;
+        } else if (arg.startsWith('--concurrency=')) {
+            const v = parseInt(arg.slice('--concurrency='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.concurrency = v;
+        } else if (arg === '--headless') {
+            params.headless = true;
+        }
+    }
+
+    return params;
+}
+
+// ==================== 数据列表 ====================
+
+function loadEntries(file) {
+    if (!fs.existsSync(file)) {
+        throw new Error(`数据列表文件不存在: ${file}`);
+    }
+    const raw = fs.readFileSync(file, 'utf-8');
+    let arr;
+    try {
+        arr = JSON.parse(raw);
+    } catch (e) {
+        throw new Error(`数据列表文件不是合法 JSON: ${e.message}`);
+    }
+    if (!Array.isArray(arr) || arr.length === 0) {
+        throw new Error('数据列表必须是非空数组');
+    }
+    return arr.map((item, i) => {
+        if (!item || typeof item !== 'object') {
+            throw new Error(`第 ${i + 1} 项不是对象`);
+        }
+        const url = typeof item.url === 'string' ? item.url.trim() : '';
+        const script = typeof item.script === 'string' ? item.script.trim() : '';
+        if (!url) {
+            throw new Error(`第 ${i + 1} 项缺少有效 url`);
+        }
+        return { url, script };
+    });
+}
+
+/** 在（子集）列表内随机取址，且下标不与上一次相同 */
+function pickEntry(entries, lastIndex) {
+    if (entries.length === 1) {
+        return { index: 0, entry: entries[0] };
+    }
+    let idx;
+    do {
+        idx = Math.floor(Math.random() * entries.length);
+    } while (idx === lastIndex);
+    return { index: idx, entry: entries[idx] };
+}
+
+/** 按取模把整表拆分为 concurrency 个子集，第 i 路取 idx % concurrency === i */
+function partitionEntries(entries, concurrency) {
+    const subsets = [];
+    for (let i = 0; i < concurrency; i++) {
+        subsets.push(entries.filter((_, idx) => idx % concurrency === i));
+    }
+    return subsets;
+}
+
+// ==================== 随机 UA ====================
+
+function randomWindowsUA() {
+    try {
+        return new UserAgent({ platform: 'Win32' }).toString();
+    } catch {
+        return null;
+    }
+}
+
+// ==================== 域名工具 ====================
+
+function hostnameOf(u) {
+    try {
+        return new URL(u).hostname || null;
+    } catch {
+        return null;
+    }
+}
+
+// ==================== 本地空页面 ====================
+
+function buildHtml(script) {
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+${script}
+</head>
+<body>helloworld</body>
+</html>`;
+}
+
+/**
+ * 主 frame 导航到配置域名时，直接返回本地空页面；其余请求一律放行。
+ */
+function setupRequestHandler(page, entry, roundState) {
+    const initialHost = hostnameOf(entry.url);
+    const html = buildHtml(entry.script);
+
+    page.setRequestInterception(true).catch(() => {});
+    page.on('request', (req) => {
+        if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+            const host = hostnameOf(req.url());
+            if (host && host === initialHost) {
+                if (!roundState.served) {
+                    roundState.served = true;
+                    roundState.log('   📄 返回本地空页面（helloworld + 广告脚本）');
+                }
+                req.respond({
+                    status: 200,
+                    contentType: 'text/html; charset=utf-8',
+                    body: html,
+                }).catch(() => {});
+                return;
+            }
+        }
+        req.continue().catch(() => {});
+    });
+}
+
+// ==================== 无痕上下文 ====================
+
+async function createFreshContext(browser) {
+    if (typeof browser.createBrowserContext === 'function') {
+        return browser.createBrowserContext();
+    }
+    if (typeof browser.createIncognitoBrowserContext === 'function') {
+        return browser.createIncognitoBrowserContext();
+    }
+    throw new Error('当前浏览器不支持创建无痕上下文');
+}
+
+// ==================== 浏览器 ====================
+
+let browser = null;
+let proxyRef = null;
+let proxyManager = null;
+let headlessFlag = isLinux;
+const activeContexts = new Set();
+let stopping = false;
+
+async function launchBrowser() {
+    const b = await launch({
+        headless: headlessFlag,
+        proxy: proxyRef.url,
+        humanize: true,
+        timezone: 'America/New_York',
+        locale: 'en-US',
+        viewport: { width: 1360, height: 768 },
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
+        ],
+    });
+    b.on('disconnected', () => {
+        tslog('⚠️  浏览器已断开');
+    });
+    browser = b;
+    tslog('🧩 浏览器已就绪');
+    return b;
+}
+
+// ==================== 单路工作循环 ====================
+
+async function workerLoop(workerIndex, subset, params) {
+    const tag = `[W${workerIndex + 1}]`;
+    const wlog = (m) => tslog(`${tag} ${m}`);
+    let lastIndex = -1;
+    let round = 0;
+
+    if (workerIndex > 0) {
+        await sleep(workerIndex * STAGGER_STEP_MS);
+        if (stopping) return;
+    }
+
+    while (!stopping) {
+        const { index, entry } = pickEntry(subset, lastIndex);
+        lastIndex = index;
+        round += 1;
+
+        if (!browser || !browser.isConnected()) {
+            wlog('❌ 浏览器已断开，退出');
+            stopping = true;
+            process.exit(1);
+        }
+
+        const ua = randomWindowsUA();
+        const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
+        wlog(`🔵 轮次 #${round} 开始访问 → ${entry.url}${uaTag}`);
+
+        let context = null;
+        try {
+            context = await createFreshContext(browser);
+            activeContexts.add(context);
+
+            const page = await context.newPage();
+            if (ua) await page.setUserAgent(ua).catch(() => {});
+            await page.authenticate({ username: proxyRef.username, password: proxyRef.password });
+            await page.setCacheEnabled(false).catch(() => {});
+            page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+            page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
+            await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
+
+            setupRequestHandler(page, entry, { log: wlog, served: false });
+
+            await page.goto(entry.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+
+            wlog(`⏳ 停留 ${params.dwellSec} 秒`);
+            await sleep(params.dwellSec * 1000);
+
+            wlog(`✅ 轮次 #${round} 结束`);
+            console.log(`ROUND_SUMMARY worker=${workerIndex + 1} round=${round} url=${entry.url}`);
+        } catch (e) {
+            wlog(`❌ 轮次 #${round} 异常: ${e.message}`);
+        } finally {
+            if (context) {
+                activeContexts.delete(context);
+                await context.close().catch(() => {});
+            }
+        }
+
+        if (!stopping) {
+            wlog(`⏳ 等待 ${ROUND_WAIT_MS / 1000} 秒后进入下一轮`);
+            await sleep(ROUND_WAIT_MS);
+        }
+    }
+}
+
+// ==================== 主流程 ====================
+
+async function run() {
+    const params = parseArgs();
+    const entries = loadEntries(params.urlsFile);
+
+    if (entries.length < params.concurrency) {
+        throw new Error(
+            `数据列表不足: ${params.urlsFile} 仅 ${entries.length} 条，但并发数为 ${params.concurrency}；` +
+            `要求 entries.length >= concurrency`
+        );
+    }
+
+    headlessFlag = params.headless;
+
+    console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 并发版)...');
+    console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
+    console.log(`🧵 并发路数: ${params.concurrency}`);
+    console.log(`⏱️  单轮停留: ${params.dwellSec.toFixed(0)} 秒`);
+    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
+
+    const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
+    proxyManager = manager;
+    proxyRef = proxy;
+    console.log(`📡 代理地址: ${proxy.host}:${proxy.port}（${params.concurrency} 路共用）\n`);
+
+    await launchBrowser();
+
+    const subsets = partitionEntries(entries, params.concurrency);
+    subsets.forEach((s, i) => console.log(`   [W${i + 1}] 子集 ${s.length} 条`));
+    console.log('');
+
+    const workers = subsets.map((subset, i) => workerLoop(i, subset, params));
+    await Promise.all(workers);
+
+    tslog('🏁 已停止，正在收尾...');
+}
+
+async function cleanup() {
+    stopping = true;
+    for (const c of activeContexts) {
+        await c.close().catch(() => {});
+    }
+    activeContexts.clear();
+    if (browser) await browser.close().catch(() => {});
+    browser = null;
+    if (proxyManager) proxyManager.destroy();
+}
+
+process.on('SIGINT', () => {
+    tslog('👋 收到退出信号，正在关闭浏览器...');
+    Promise.race([cleanup(), sleep(5000)]).finally(() => process.exit(0));
+});
+
+const isMain = process.argv[1] &&
+    path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
+    run()
+        .then(() => cleanup())
+        .then(() => process.exit(0))
+        .catch(async (error) => {
+            console.error('❌ 未捕获的错误:', error);
+            await cleanup();
+            process.exit(1);
+        });
+}
