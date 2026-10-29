@@ -183,19 +183,23 @@ function setupRequestHandler(page, entry, roundState) {
 
 // ==================== 广告检测与点击 ====================
 
-/** 在主页面中查找已加载完成的广告 iframe，返回其视口包围盒 */
+/** 在主页面中查找已加载完成且已滑入视口的广告 iframe，返回其视口包围盒 */
 async function findAdRect(page) {
     return page.evaluate(() => {
-        const frames = Array.from(document.querySelectorAll('iframe[srcdoc]'));
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const frames = Array.from(document.querySelectorAll('iframe'));
         for (const f of frames) {
-            const srcdoc = (f.getAttribute('srcdoc') || '').trim();
-            if (!srcdoc || srcdoc === 'blank page') continue;
+            if ((f.getAttribute('srcdoc') || '').trim() === 'blank page') continue;
 
             const rect = f.getBoundingClientRect();
             if (rect.width <= 0 || rect.height <= 0) continue;
 
             const style = window.getComputedStyle(f);
             if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+            // 广告滑入前位于屏幕外（left:110%），必须完全进入视口才可点击
+            if (rect.left < 0 || rect.top < 0 || rect.right > vw || rect.bottom > vh) continue;
 
             let doc;
             try {
@@ -204,6 +208,7 @@ async function findAdRect(page) {
                 continue;
             }
             if (!doc || !doc.body || !doc.body.innerHTML.trim()) continue;
+            if (doc.readyState !== 'complete') continue;
 
             return { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
         }
@@ -243,9 +248,23 @@ async function detectAndClickAd(page, params, wlog) {
     await sleep(delay);
     if (stopping) return false;
 
-    const { x, y } = randomPointInRect(rect);
+    // 延迟期间广告可能仍在滑入/移动，点击前重新取一次实时坐标
+    let clickRect = null;
     try {
-        await page.mouse.click(x, y);
+        clickRect = await findAdRect(page);
+    } catch {
+        clickRect = null;
+    }
+    if (!clickRect) {
+        wlog('   ⚠️ 点击前广告不在视口内，跳过点击');
+        return false;
+    }
+
+    const { x, y } = randomPointInRect(clickRect);
+    try {
+        await page.mouse.move(x, y, { steps: 10 });
+        await sleep(100);
+        await page.mouse.click(x, y, { delay: 80 });
         wlog(`   👆 已点击广告 (${x}, ${y})`);
     } catch (e) {
         wlog(`   ⚠️ 点击广告失败: ${e.message}`);
