@@ -2,7 +2,7 @@
  * mondiad.js — 多路并发循环访问，返回本地空页面并加载 Mondiad 广告脚本
  *
  * 用法:
- *   node mondiad.js --concurrency=1 --dwell-sec=20 [--urls=./mondiad-urls.json] [--headless]
+ *   node mondiad.js --concurrency=1 --dwell-sec=60 [--urls=./mondiad-urls.json] [--headless]
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -10,7 +10,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import UserAgent from 'user-agents';
-import { createProxy } from './shared/proxy-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -39,7 +38,7 @@ function parseArgs() {
 
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
-        dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 20,
+        dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 60,
         concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
@@ -187,8 +186,6 @@ async function createFreshContext(browser) {
 // ==================== 浏览器 ====================
 
 let browser = null;
-let proxyRef = null;
-let proxyManager = null;
 let headlessFlag = isLinux;
 const activeContexts = new Set();
 let stopping = false;
@@ -196,7 +193,6 @@ let stopping = false;
 async function launchBrowser() {
     const b = await launch({
         headless: headlessFlag,
-        proxy: proxyRef.url,
         humanize: true,
         timezone: 'America/New_York',
         locale: 'en-US',
@@ -252,7 +248,6 @@ async function workerLoop(workerIndex, subset, params) {
 
             const page = await context.newPage();
             if (ua) await page.setUserAgent(ua).catch(() => {});
-            await page.authenticate({ username: proxyRef.username, password: proxyRef.password });
             await page.setCacheEnabled(false).catch(() => {});
             page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
             page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
@@ -304,11 +299,6 @@ async function run() {
     console.log(`⏱️  单轮停留: ${params.dwellSec.toFixed(0)} 秒`);
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
 
-    const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
-    proxyManager = manager;
-    proxyRef = proxy;
-    console.log(`📡 代理地址: ${proxy.host}:${proxy.port}（${params.concurrency} 路共用）\n`);
-
     await launchBrowser();
 
     const subsets = partitionEntries(entries, params.concurrency);
@@ -329,7 +319,6 @@ async function cleanup() {
     activeContexts.clear();
     if (browser) await browser.close().catch(() => {});
     browser = null;
-    if (proxyManager) proxyManager.destroy();
 }
 
 process.on('SIGINT', () => {
