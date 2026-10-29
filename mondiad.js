@@ -2,7 +2,8 @@
  * mondiad.js — 多路并发循环访问，返回本地空页面并加载 Mondiad 广告脚本
  *
  * 用法:
- *   node mondiad.js --concurrency=1 --dwell-sec=120 [--urls=./mondiad-urls.json] [--headless]
+ *   node mondiad.js --concurrency=1 [--urls=./mondiad-urls.json]
+ *     [--ad-timeout-sec=30] [--after-click-sec=2] [--headless]
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -21,6 +22,9 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_CONCURRENCY = 1;
 const STAGGER_STEP_MS = 2000;
 const ROUND_WAIT_MS = 5000;
+const AD_POLL_STEP_MS = 500;
+const CLICK_DELAY_MIN_MS = 1000;
+const CLICK_DELAY_MAX_MS = 3000;
 
 // ==================== 日志 ====================
 
@@ -34,12 +38,14 @@ function tslog(msg) {
 function parseArgs() {
     const args = process.argv.slice(2);
 
-    const envDwell = parseFloat(process.env.DWELL_SEC);
+    const envAdTimeout = parseFloat(process.env.AD_TIMEOUT_SEC);
+    const envAfterClick = parseFloat(process.env.AFTER_CLICK_SEC);
     const envConc = parseInt(process.env.CONCURRENCY, 10);
 
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
-        dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 120,
+        adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : 30,
+        afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : 2,
         concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
@@ -47,9 +53,12 @@ function parseArgs() {
     for (const arg of args) {
         if (arg.startsWith('--urls=')) {
             params.urlsFile = arg.slice('--urls='.length);
-        } else if (arg.startsWith('--dwell-sec=')) {
-            const v = parseFloat(arg.slice('--dwell-sec='.length));
-            if (Number.isFinite(v) && v > 0) params.dwellSec = v;
+        } else if (arg.startsWith('--ad-timeout-sec=')) {
+            const v = parseFloat(arg.slice('--ad-timeout-sec='.length));
+            if (Number.isFinite(v) && v > 0) params.adTimeoutSec = v;
+        } else if (arg.startsWith('--after-click-sec=')) {
+            const v = parseFloat(arg.slice('--after-click-sec='.length));
+            if (Number.isFinite(v) && v >= 0) params.afterClickSec = v;
         } else if (arg.startsWith('--concurrency=')) {
             const v = parseInt(arg.slice('--concurrency='.length), 10);
             if (Number.isInteger(v) && v > 0) params.concurrency = v;
@@ -172,6 +181,82 @@ function setupRequestHandler(page, entry, roundState) {
     });
 }
 
+// ==================== 广告检测与点击 ====================
+
+/** 在主页面中查找已加载完成的广告 iframe，返回其视口包围盒 */
+async function findAdRect(page) {
+    return page.evaluate(() => {
+        const frames = Array.from(document.querySelectorAll('iframe[srcdoc]'));
+        for (const f of frames) {
+            const srcdoc = (f.getAttribute('srcdoc') || '').trim();
+            if (!srcdoc || srcdoc === 'blank page') continue;
+
+            const rect = f.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) continue;
+
+            const style = window.getComputedStyle(f);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+            let doc;
+            try {
+                doc = f.contentDocument;
+            } catch {
+                continue;
+            }
+            if (!doc || !doc.body || !doc.body.innerHTML.trim()) continue;
+
+            return { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+        }
+        return null;
+    });
+}
+
+function randomPointInRect(rect) {
+    return {
+        x: Math.round(rect.x + rect.width * (0.2 + Math.random() * 0.6)),
+        y: Math.round(rect.y + rect.height * (0.2 + Math.random() * 0.6)),
+    };
+}
+
+/** 轮询等待广告加载，命中后随机延迟点击一次并停留；未命中直接返回 */
+async function detectAndClickAd(page, params, wlog) {
+    const deadline = Date.now() + params.adTimeoutSec * 1000;
+    let rect = null;
+
+    while (!stopping && Date.now() < deadline) {
+        try {
+            rect = await findAdRect(page);
+        } catch {
+            rect = null;
+        }
+        if (rect) break;
+        await sleep(AD_POLL_STEP_MS);
+    }
+
+    if (!rect) {
+        wlog(`   ⚠️ ${params.adTimeoutSec} 秒内未检测到广告，跳过点击`);
+        return false;
+    }
+
+    const delay = CLICK_DELAY_MIN_MS + Math.random() * (CLICK_DELAY_MAX_MS - CLICK_DELAY_MIN_MS);
+    wlog(`   🎯 广告已加载，${(delay / 1000).toFixed(1)} 秒后点击`);
+    await sleep(delay);
+    if (stopping) return false;
+
+    const { x, y } = randomPointInRect(rect);
+    try {
+        await page.mouse.click(x, y);
+        wlog(`   👆 已点击广告 (${x}, ${y})`);
+    } catch (e) {
+        wlog(`   ⚠️ 点击广告失败: ${e.message}`);
+        return false;
+    }
+
+    wlog(`   ⏳ 点击后停留 ${params.afterClickSec} 秒`);
+    await sleep(params.afterClickSec * 1000);
+    return true;
+}
+
 // ==================== 无痕上下文 ====================
 
 async function createFreshContext(browser) {
@@ -262,8 +347,7 @@ async function workerLoop(workerIndex, subset, params) {
 
             await page.goto(entry.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
-            wlog(`⏳ 停留 ${params.dwellSec} 秒`);
-            await sleep(params.dwellSec * 1000);
+            await detectAndClickAd(page, params, wlog);
 
             wlog(`✅ 轮次 #${round} 结束`);
             console.log(`ROUND_SUMMARY worker=${workerIndex + 1} round=${round} url=${entry.url}`);
@@ -301,7 +385,7 @@ async function run() {
     console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 并发版)...');
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
     console.log(`🧵 并发路数: ${params.concurrency}`);
-    console.log(`⏱️  单轮停留: ${params.dwellSec.toFixed(0)} 秒`);
+    console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒`);
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
 
     const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
