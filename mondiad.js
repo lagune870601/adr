@@ -2,7 +2,7 @@
  * mondiad.js — 多路并发循环访问，返回本地空页面并加载 Mondiad 广告脚本
  *
  * 用法:
- *   node mondiad.js --concurrency=1 --dwell-sec=60 [--urls=./mondiad-urls.json] [--headless]
+ *   node mondiad.js --concurrency=1 --dwell-sec=120 [--urls=./mondiad-urls.json] [--headless]
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -38,7 +38,7 @@ function parseArgs() {
 
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
-        dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 60,
+        dwellSec: Number.isFinite(envDwell) && envDwell > 0 ? envDwell : 120,
         concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
