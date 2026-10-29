@@ -3,7 +3,7 @@
  *
  * 用法:
  *   node mondiad.js --concurrency=1 [--urls=./mondiad-urls.json]
- *     [--ad-timeout-sec=30] [--after-click-sec=5] [--headless]
+ *     [--ad-timeout-sec=30] [--after-click-sec=2] [--headless]
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -20,11 +20,12 @@ const isLinux = false;
 const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_CONCURRENCY = 1;
-const STAGGER_STEP_MS = 2000;
+const STAGGER_STEP_MS = 10000;
 const ROUND_WAIT_MS = 5000;
 const AD_POLL_STEP_MS = 500;
 const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
+const AFTER_CLICK_SEC = 5;
 
 // ==================== 日志 ====================
 
@@ -45,7 +46,7 @@ function parseArgs() {
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
         adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : 30,
-        afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : 5,
+        afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
         concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
