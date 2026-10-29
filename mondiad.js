@@ -27,6 +27,10 @@ const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 5;
 
+// 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
+const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
+const ALLOWED_SCRIPT_HOSTS = ['ss.mrmnd.com'];
+
 // ==================== 日志 ====================
 
 function tslog(msg) {
@@ -155,7 +159,8 @@ ${script}
 }
 
 /**
- * 主 frame 导航到配置域名时，直接返回本地空页面；其余请求一律放行。
+ * 主 frame 导航到配置域名时，直接返回本地空页面；
+ * 其余请求中，拦掉样式/字体/媒体类资源，外部脚本只放行白名单域名。
  */
 function setupRequestHandler(page, entry, roundState) {
     const initialHost = hostnameOf(entry.url);
@@ -175,6 +180,19 @@ function setupRequestHandler(page, entry, roundState) {
                     contentType: 'text/html; charset=utf-8',
                     body: html,
                 }).catch(() => {});
+                return;
+            }
+        }
+
+        const type = req.resourceType();
+        if (BLOCKED_RESOURCE_TYPES.includes(type)) {
+            req.abort().catch(() => {});
+            return;
+        }
+        if (type === 'script') {
+            const host = hostnameOf(req.url());
+            if (!host || !ALLOWED_SCRIPT_HOSTS.includes(host)) {
+                req.abort().catch(() => {});
                 return;
             }
         }
