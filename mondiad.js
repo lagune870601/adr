@@ -3,7 +3,7 @@
  *
  * 用法:
  *   node mondiad.js --concurrency=1 [--urls=./mondiad-urls.json]
- *     [--ad-timeout-sec=30] [--after-click-sec=2] [--headless]
+ *     [--ad-timeout-sec=30] [--after-click-sec=2] [--click-rate=0.2] [--headless]
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -27,6 +27,8 @@ const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
+// 检测到广告后的点击概率，控制在 20% 左右，避免每次曝光都产生点击
+const CLICK_PROBABILITY = 0.2;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
@@ -46,12 +48,14 @@ function parseArgs() {
 
     const envAdTimeout = parseFloat(process.env.AD_TIMEOUT_SEC);
     const envAfterClick = parseFloat(process.env.AFTER_CLICK_SEC);
+    const envClickRate = parseFloat(process.env.CLICK_RATE);
     const envConc = parseInt(process.env.CONCURRENCY, 10);
 
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
         adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : AD_TIMEOUT_SEC,
         afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
+        clickProbability: Number.isFinite(envClickRate) && envClickRate >= 0 && envClickRate <= 1 ? envClickRate : CLICK_PROBABILITY,
         concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
@@ -65,6 +69,9 @@ function parseArgs() {
         } else if (arg.startsWith('--after-click-sec=')) {
             const v = parseFloat(arg.slice('--after-click-sec='.length));
             if (Number.isFinite(v) && v >= 0) params.afterClickSec = v;
+        } else if (arg.startsWith('--click-rate=')) {
+            const v = parseFloat(arg.slice('--click-rate='.length));
+            if (Number.isFinite(v) && v >= 0 && v <= 1) params.clickProbability = v;
         } else if (arg.startsWith('--concurrency=')) {
             const v = parseInt(arg.slice('--concurrency='.length), 10);
             if (Number.isInteger(v) && v > 0) params.concurrency = v;
@@ -243,7 +250,7 @@ function randomPointInRect(rect) {
     };
 }
 
-/** 轮询等待广告加载，命中后随机延迟点击一次并停留；未命中直接返回 */
+/** 轮询等待广告加载，命中后按配置概率决定是否点击；未命中或未抽中直接返回 */
 async function detectAndClickAd(page, params, wlog) {
     const deadline = Date.now() + params.adTimeoutSec * 1000;
     let rect = null;
@@ -260,6 +267,11 @@ async function detectAndClickAd(page, params, wlog) {
 
     if (!rect) {
         wlog(`   ⚠️ ${params.adTimeoutSec} 秒内未检测到广告，跳过点击`);
+        return false;
+    }
+
+    if (Math.random() >= params.clickProbability) {
+        wlog(`   🎲 广告已加载，本次不点击（点击率 ${(params.clickProbability * 100).toFixed(0)}%）`);
         return false;
     }
 
@@ -424,7 +436,7 @@ async function run() {
     console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 并发版)...');
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
     console.log(`🧵 并发路数: ${params.concurrency}`);
-    console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒`);
+    console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}%`);
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
 
     const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
