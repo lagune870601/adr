@@ -1,9 +1,11 @@
 /**
- * mondiad.js — 多路并发循环访问，返回本地空页面并加载 Mondiad 广告脚本
+ * mondiad.js — 循环访问，返回本地空页面并加载 Mondiad 广告脚本
  *
  * 用法:
- *   node mondiad.js --concurrency=1 [--urls=./mondiad-urls.json]
+ *   node mondiad.js [--urls=./mondiad-urls.json]
  *     [--ad-timeout-sec=30] [--after-click-sec=2] [--click-rate=0.2] [--headless]
+ *
+ * 每轮访问前从 NovProxy API 获取一个新 SOCKS5 代理，并重启浏览器重新加载 PAC。
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -11,7 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import UserAgent from 'user-agents';
-import { createProxy } from './shared/proxy-utils.js';
+import { fetchNovProxy } from './shared/proxy-utils.js';
 import { startMndPac, isMndHost } from './shared/mnd-pac.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -20,8 +22,6 @@ const isLinux = true;
 
 const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_CONCURRENCY = 1;
-const STAGGER_STEP_MS = 10000;
 const ROUND_WAIT_MS = 5000;
 const AD_POLL_STEP_MS = 500;
 const CLICK_DELAY_MIN_MS = 1000;
@@ -49,14 +49,12 @@ function parseArgs() {
     const envAdTimeout = parseFloat(process.env.AD_TIMEOUT_SEC);
     const envAfterClick = parseFloat(process.env.AFTER_CLICK_SEC);
     const envClickRate = parseFloat(process.env.CLICK_RATE);
-    const envConc = parseInt(process.env.CONCURRENCY, 10);
 
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
         adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : AD_TIMEOUT_SEC,
         afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
         clickProbability: Number.isFinite(envClickRate) && envClickRate >= 0 && envClickRate <= 1 ? envClickRate : CLICK_PROBABILITY,
-        concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
     };
 
@@ -72,9 +70,6 @@ function parseArgs() {
         } else if (arg.startsWith('--click-rate=')) {
             const v = parseFloat(arg.slice('--click-rate='.length));
             if (Number.isFinite(v) && v >= 0 && v <= 1) params.clickProbability = v;
-        } else if (arg.startsWith('--concurrency=')) {
-            const v = parseInt(arg.slice('--concurrency='.length), 10);
-            if (Number.isInteger(v) && v > 0) params.concurrency = v;
         } else if (arg === '--headless') {
             params.headless = true;
         }
@@ -122,15 +117,6 @@ function pickEntry(entries, lastIndex) {
         idx = Math.floor(Math.random() * entries.length);
     } while (idx === lastIndex);
     return { index: idx, entry: entries[idx] };
-}
-
-/** 按取模把整表拆分为 concurrency 个子集，第 i 路取 idx % concurrency === i */
-function partitionEntries(entries, concurrency) {
-    const subsets = [];
-    for (let i = 0; i < concurrency; i++) {
-        subsets.push(entries.filter((_, idx) => idx % concurrency === i));
-    }
-    return subsets;
 }
 
 // ==================== 随机 UA ====================
@@ -324,7 +310,6 @@ async function createFreshContext(browser) {
 // ==================== 浏览器 ====================
 
 let browser = null;
-let proxyManager = null;
 let pacRef = null;
 let headlessFlag = isLinux;
 const activeContexts = new Set();
@@ -346,44 +331,43 @@ async function launchBrowser(pacUrl) {
             `--proxy-pac-url=${pacUrl}`,
         ],
     });
-    b.on('disconnected', () => {
-        tslog('⚠️  浏览器已断开');
-    });
     browser = b;
     tslog('🧩 浏览器已就绪');
     return b;
 }
 
-// ==================== 单路工作循环 ====================
+// ==================== 轮次循环 ====================
 
-async function workerLoop(workerIndex, subset, params) {
-    const tag = `[W${workerIndex + 1}]`;
-    const wlog = (m) => tslog(`${tag} ${m}`);
+async function roundLoop(entries, params) {
     let lastIndex = -1;
     let round = 0;
 
-    if (workerIndex > 0) {
-        await sleep(workerIndex * STAGGER_STEP_MS);
-        if (stopping) return;
-    }
-
     while (!stopping) {
-        const { index, entry } = pickEntry(subset, lastIndex);
-        lastIndex = index;
         round += 1;
+        const { index, entry } = pickEntry(entries, lastIndex);
+        lastIndex = index;
 
-        if (!browser || !browser.isConnected()) {
-            wlog('❌ 浏览器已断开，退出');
-            stopping = true;
-            process.exit(1);
+        // 每轮启动浏览器前获取一个新代理；失败则跳过本轮
+        let proxy;
+        try {
+            proxy = await fetchNovProxy();
+        } catch (e) {
+            tslog(`⚠️  轮次 #${round} 获取代理失败: ${e.message}，跳过本轮`);
+            if (!stopping) {
+                tslog(`⏳ 等待 ${ROUND_WAIT_MS / 1000} 秒后重试`);
+                await sleep(ROUND_WAIT_MS);
+            }
+            continue;
         }
 
         const ua = randomWindowsUA();
         const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
-        wlog(`🔵 轮次 #${round} 开始访问 → ${entry.url}${uaTag}`);
+        tslog(`🔵 轮次 #${round} 开始访问 → ${entry.url} | 代理 ${proxy.host}:${proxy.port}${uaTag}`);
 
         let context = null;
         try {
+            browser = await launchBrowser(pacRef.pacUrlFor(proxy));
+
             context = await createFreshContext(browser);
             activeContexts.add(context);
 
@@ -395,25 +379,29 @@ async function workerLoop(workerIndex, subset, params) {
             page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
             await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
 
-            setupRequestHandler(page, entry, { log: wlog, served: false });
+            setupRequestHandler(page, entry, { log: tslog, served: false });
 
             await page.goto(entry.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
-            await detectAndClickAd(page, params, wlog);
+            await detectAndClickAd(page, params, tslog);
 
-            wlog(`✅ 轮次 #${round} 结束`);
-            console.log(`ROUND_SUMMARY worker=${workerIndex + 1} round=${round} url=${entry.url}`);
+            tslog(`✅ 轮次 #${round} 结束`);
+            console.log(`ROUND_SUMMARY round=${round} url=${entry.url} proxy=${proxy.host}:${proxy.port}`);
         } catch (e) {
-            wlog(`❌ 轮次 #${round} 异常: ${e.message}`);
+            tslog(`❌ 轮次 #${round} 异常: ${e.message}`);
         } finally {
             if (context) {
                 activeContexts.delete(context);
                 await context.close().catch(() => {});
             }
+            if (browser) {
+                await browser.close().catch(() => {});
+                browser = null;
+            }
         }
 
         if (!stopping) {
-            wlog(`⏳ 等待 ${ROUND_WAIT_MS / 1000} 秒后进入下一轮`);
+            tslog(`⏳ 等待 ${ROUND_WAIT_MS / 1000} 秒后进入下一轮`);
             await sleep(ROUND_WAIT_MS);
         }
     }
@@ -424,37 +412,17 @@ async function workerLoop(workerIndex, subset, params) {
 async function run() {
     const params = parseArgs();
     const entries = loadEntries(params.urlsFile);
-
-    if (entries.length < params.concurrency) {
-        throw new Error(
-            `数据列表不足: ${params.urlsFile} 仅 ${entries.length} 条，但并发数为 ${params.concurrency}；` +
-            `要求 entries.length >= concurrency`
-        );
-    }
-
     headlessFlag = params.headless;
 
-    console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 并发版)...');
+    console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 每轮换代理)...');
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
-    console.log(`🧵 并发路数: ${params.concurrency}`);
     console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}%`);
-    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}\n`);
+    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
+    console.log('📡 代理来源: NovProxy API（每轮启动浏览器前获取，仅 mnd 域名经 SOCKS5，其余直连）\n');
 
-    const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
-    proxyManager = manager;
+    pacRef = await startMndPac();
 
-    pacRef = await startMndPac(proxy);
-    console.log(`📡 代理地址: ${proxy.host}:${proxy.port}（仅 mnd 域名经 SOCKS5，其余直连）`);
-    console.log(`🧭 PAC: ${pacRef.pacUrl}\n`);
-
-    await launchBrowser(pacRef.pacUrl);
-
-    const subsets = partitionEntries(entries, params.concurrency);
-    subsets.forEach((s, i) => console.log(`   [W${i + 1}] 子集 ${s.length} 条`));
-    console.log('');
-
-    const workers = subsets.map((subset, i) => workerLoop(i, subset, params));
-    await Promise.all(workers);
+    await roundLoop(entries, params);
 
     tslog('🏁 已停止，正在收尾...');
 }
@@ -471,7 +439,6 @@ async function cleanup() {
         pacRef.close();
         pacRef = null;
     }
-    if (proxyManager) proxyManager.destroy();
 }
 
 process.on('SIGINT', () => {
