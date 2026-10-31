@@ -168,6 +168,7 @@ ${script}
 
 /**
  * 主 frame 导航到配置域名时，直接返回本地空页面；
+ * 同域名的其余请求（如 favicon.ico）一律中止，避免经代理发出；
  * 其余请求中，拦掉样式/字体/媒体类资源，外部脚本只放行白名单域名。
  */
 function setupRequestHandler(page, entry, roundState) {
@@ -176,9 +177,9 @@ function setupRequestHandler(page, entry, roundState) {
 
     page.setRequestInterception(true).catch(() => {});
     page.on('request', (req) => {
-        if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
-            const host = hostnameOf(req.url());
-            if (host && host === initialHost) {
+        const host = hostnameOf(req.url());
+        if (host && host === initialHost) {
+            if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
                 if (!roundState.served) {
                     roundState.served = true;
                     roundState.log('   📄 返回本地空页面（helloworld + 广告脚本）');
@@ -188,8 +189,10 @@ function setupRequestHandler(page, entry, roundState) {
                     contentType: 'text/html; charset=utf-8',
                     body: html,
                 }).catch(() => {});
-                return;
+            } else {
+                req.abort().catch(() => {});
             }
+            return;
         }
 
         const type = req.resourceType();
@@ -198,7 +201,6 @@ function setupRequestHandler(page, entry, roundState) {
             return;
         }
         if (type === 'script') {
-            const host = hostnameOf(req.url());
             if (!host || !ALLOWED_SCRIPT_HOSTS.includes(host)) {
                 req.abort().catch(() => {});
                 return;
