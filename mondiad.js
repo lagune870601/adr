@@ -21,11 +21,12 @@ const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_CONCURRENCY = 1;
 const STAGGER_STEP_MS = 10000;
-const ROUND_WAIT_MS = 5000;
+const ROUND_WAIT_MS = 60000;
 const AD_POLL_STEP_MS = 500;
 const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
-const AFTER_CLICK_SEC = 5;
+const AFTER_CLICK_SEC = 10;
+const AD_TIMEOUT_SEC = 60;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
@@ -49,7 +50,7 @@ function parseArgs() {
 
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
-        adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : 30,
+        adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : AD_TIMEOUT_SEC,
         afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
         concurrency: Number.isInteger(envConc) && envConc > 0 ? envConc : DEFAULT_CONCURRENCY,
         headless: isLinux,
