@@ -12,6 +12,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import UserAgent from 'user-agents';
 import { createProxy } from './shared/proxy-utils.js';
+import { startMndPac, isMndHost } from './shared/mnd-pac.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -32,11 +33,6 @@ const CLICK_PROBABILITY = 1;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
-
-/** 仅放行主机名包含 mnd 的域名（含子域名，大小写不敏感） */
-function isMndHost(host) {
-    return !!host && host.toLowerCase().includes('mnd');
-}
 
 // ==================== 日志 ====================
 
@@ -328,16 +324,15 @@ async function createFreshContext(browser) {
 // ==================== 浏览器 ====================
 
 let browser = null;
-let proxyRef = null;
 let proxyManager = null;
+let pacRef = null;
 let headlessFlag = isLinux;
 const activeContexts = new Set();
 let stopping = false;
 
-async function launchBrowser() {
+async function launchBrowser(pacUrl) {
     const b = await launch({
         headless: headlessFlag,
-        proxy: proxyRef.url,
         humanize: true,
         timezone: 'America/New_York',
         locale: 'en-US',
@@ -348,6 +343,7 @@ async function launchBrowser() {
             '--disable-dev-shm-usage',
             '--disable-accelerated-2d-canvas',
             '--disable-gpu',
+            `--proxy-pac-url=${pacUrl}`,
         ],
     });
     b.on('disconnected', () => {
@@ -392,8 +388,8 @@ async function workerLoop(workerIndex, subset, params) {
             activeContexts.add(context);
 
             const page = await context.newPage();
+
             if (ua) await page.setUserAgent(ua).catch(() => {});
-            await page.authenticate({ username: proxyRef.username, password: proxyRef.password });
             await page.setCacheEnabled(false).catch(() => {});
             page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
             page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
@@ -446,10 +442,12 @@ async function run() {
 
     const { proxy, manager } = await createProxy({ country: 'US', protocol: 'http' });
     proxyManager = manager;
-    proxyRef = proxy;
-    console.log(`📡 代理地址: ${proxy.host}:${proxy.port}（${params.concurrency} 路共用）\n`);
 
-    await launchBrowser();
+    pacRef = await startMndPac(proxy);
+    console.log(`📡 代理地址: ${proxy.host}:${proxy.port}（仅 mnd 域名经 SOCKS5，其余直连）`);
+    console.log(`🧭 PAC: ${pacRef.pacUrl}\n`);
+
+    await launchBrowser(pacRef.pacUrl);
 
     const subsets = partitionEntries(entries, params.concurrency);
     subsets.forEach((s, i) => console.log(`   [W${i + 1}] 子集 ${s.length} 条`));
@@ -469,6 +467,10 @@ async function cleanup() {
     activeContexts.clear();
     if (browser) await browser.close().catch(() => {});
     browser = null;
+    if (pacRef) {
+        pacRef.close();
+        pacRef = null;
+    }
     if (proxyManager) proxyManager.destroy();
 }
 
