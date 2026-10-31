@@ -358,35 +358,6 @@ async function launchBrowser() {
     return b;
 }
 
-// ==================== 弹窗防护 ====================
-
-/**
- * 广告点击会通过 window.open / target=_blank 打开新页面；
- * 新页面是独立 target，page 级请求拦截管不到，会直接经代理加载完整页面。
- * 因此要在页面及所有子 frame 中禁用这些弹窗入口（脚本创建 iframe 时同样生效）。
- */
-function installPopupGuard(page) {
-    return page.evaluateOnNewDocument(() => {
-        window.open = () => null;
-
-        document.addEventListener('click', (e) => {
-            const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
-            const anchor = path.find((node) => (
-                node instanceof Element &&
-                (node.tagName === 'A' || node.tagName === 'AREA') &&
-                node.hasAttribute('target')
-            ));
-            if (anchor) e.preventDefault();
-        }, true);
-
-        document.addEventListener('submit', (e) => {
-            if (e.target instanceof HTMLFormElement && e.target.hasAttribute('target')) {
-                e.preventDefault();
-            }
-        }, true);
-    });
-}
-
 // ==================== 单路工作循环 ====================
 
 async function workerLoop(workerIndex, subset, params) {
@@ -416,35 +387,17 @@ async function workerLoop(workerIndex, subset, params) {
         wlog(`🔵 轮次 #${round} 开始访问 → ${entry.url}${uaTag}`);
 
         let context = null;
-        let closeExtraPage = null;
         try {
             context = await createFreshContext(browser);
             activeContexts.add(context);
 
             const page = await context.newPage();
-
-            // 兜底：万一仍产生新页面（如非标准弹窗路径），立即关闭，尽量少发请求
-            closeExtraPage = (target) => {
-                let isExtraPage;
-                try {
-                    isExtraPage = target.type() === 'page' && target.browserContext() === context;
-                } catch {
-                    return;
-                }
-                if (!isExtraPage) return;
-                target.page()
-                    .then((extra) => (extra && extra !== page ? extra.close() : null))
-                    .catch(() => {});
-            };
-            browser.on('targetcreated', closeExtraPage);
-
             if (ua) await page.setUserAgent(ua).catch(() => {});
             await page.authenticate({ username: proxyRef.username, password: proxyRef.password });
             await page.setCacheEnabled(false).catch(() => {});
             page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
             page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
             await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
-            await installPopupGuard(page);
 
             setupRequestHandler(page, entry, { log: wlog, served: false });
 
@@ -457,10 +410,6 @@ async function workerLoop(workerIndex, subset, params) {
         } catch (e) {
             wlog(`❌ 轮次 #${round} 异常: ${e.message}`);
         } finally {
-            if (closeExtraPage) {
-                browser?.off('targetcreated', closeExtraPage);
-                closeExtraPage = null;
-            }
             if (context) {
                 activeContexts.delete(context);
                 await context.close().catch(() => {});
