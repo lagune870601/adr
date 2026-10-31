@@ -32,11 +32,7 @@ const CLICK_PROBABILITY = 1;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
-
-/** 仅放行主机名包含 mnd 的域名（含子域名，大小写不敏感） */
-function isMndHost(host) {
-    return !!host && host.toLowerCase().includes('mnd');
-}
+const ALLOWED_SCRIPT_HOSTS = ['ss.mrmnd.com'];
 
 // ==================== 日志 ====================
 
@@ -173,8 +169,7 @@ ${script}
 /**
  * 主 frame 导航到配置域名时，直接返回本地空页面；
  * 同域名的其余请求（如 favicon.ico）一律中止，避免经代理发出；
- * 其余请求中，省流类型照拦，只有主机名包含 mnd 的域名才放行，
- * 其余域名（含 data:/blob: 等无主机名请求）全部中止。
+ * 其余请求中，拦掉样式/字体/媒体类资源，外部脚本只放行白名单域名。
  */
 function setupRequestHandler(page, entry, roundState) {
     const initialHost = hostnameOf(entry.url);
@@ -205,9 +200,11 @@ function setupRequestHandler(page, entry, roundState) {
             req.abort().catch(() => {});
             return;
         }
-        if (!isMndHost(host)) {
-            req.abort().catch(() => {});
-            return;
+        if (type === 'script') {
+            if (!host || !ALLOWED_SCRIPT_HOSTS.includes(host)) {
+                req.abort().catch(() => {});
+                return;
+            }
         }
         req.continue().catch(() => {});
     });
