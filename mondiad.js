@@ -22,14 +22,14 @@ const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_CONCURRENCY = 1;
 const STAGGER_STEP_MS = 10000;
-const ROUND_WAIT_MS = 300000;
+const ROUND_WAIT_MS = 5000;
 const AD_POLL_STEP_MS = 500;
 const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
 // 检测到广告后的点击概率，控制在 20% 左右，避免每次曝光都产生点击
-const CLICK_PROBABILITY = 1;
+const CLICK_PROBABILITY = 0.2;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
