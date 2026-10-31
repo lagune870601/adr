@@ -1,11 +1,14 @@
 /**
- * mondiad.js — 循环访问，返回本地空页面并加载 Mondiad 广告脚本
+ * mondiad.js — 按美国东部时间作息调度访问，返回本地空页面并加载 Mondiad 广告脚本
  *
  * 用法:
  *   node mondiad.js [--urls=./mondiad-urls.json]
- *     [--ad-timeout-sec=30] [--after-click-sec=2] [--click-rate=0.2] [--headless]
+ *     [--visits-per-day=250] [--ad-timeout-sec=60] [--after-click-sec=10]
+ *     [--click-rate=0.2] [--headless]
  *
- * 每轮访问前从 NovProxy API 获取一个新 SOCKS5 代理，并重启浏览器重新加载 PAC。
+ * 每个广告链接独立排程：日访问量服从泊松分布（默认 250），按美国东部时间的
+ * 小时权重分配（凌晨稀少、晚间最高）。每次访问开始时先决定是否点击。
+ * 每次访问前从 NovProxy API 代理池随机取一个 SOCKS5 代理，并重启浏览器重新加载 PAC。
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -15,6 +18,7 @@ import { fileURLToPath } from 'url';
 import UserAgent from 'user-agents';
 import { fetchNovProxy } from './shared/proxy-utils.js';
 import { startMndPac, isMndHost } from './shared/mnd-pac.js';
+import { etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -22,14 +26,16 @@ const isLinux = true;
 
 const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
-const ROUND_WAIT_MS = 5000;
 const AD_POLL_STEP_MS = 500;
 const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
-// 检测到广告后的点击概率，控制在 20% 左右，避免每次曝光都产生点击
+// 每次访问开始即决定是否点击：约 20% 的访问等待广告并点击，其余仅停留 5 秒后关闭
 const CLICK_PROBABILITY = 0.2;
+const VISITS_PER_DAY = 250;
+const NON_CLICK_DWELL_MS = 5000;
+const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
@@ -49,12 +55,14 @@ function parseArgs() {
     const envAdTimeout = parseFloat(process.env.AD_TIMEOUT_SEC);
     const envAfterClick = parseFloat(process.env.AFTER_CLICK_SEC);
     const envClickRate = parseFloat(process.env.CLICK_RATE);
+    const envVisits = parseInt(process.env.VISITS_PER_DAY, 10);
 
     const params = {
         urlsFile: path.join(__dirname, 'mondiad-urls.json'),
         adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : AD_TIMEOUT_SEC,
         afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
         clickProbability: Number.isFinite(envClickRate) && envClickRate >= 0 && envClickRate <= 1 ? envClickRate : CLICK_PROBABILITY,
+        visitsPerDay: Number.isInteger(envVisits) && envVisits > 0 ? envVisits : VISITS_PER_DAY,
         headless: isLinux,
     };
 
@@ -70,6 +78,9 @@ function parseArgs() {
         } else if (arg.startsWith('--click-rate=')) {
             const v = parseFloat(arg.slice('--click-rate='.length));
             if (Number.isFinite(v) && v >= 0 && v <= 1) params.clickProbability = v;
+        } else if (arg.startsWith('--visits-per-day=')) {
+            const v = parseInt(arg.slice('--visits-per-day='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.visitsPerDay = v;
         } else if (arg === '--headless') {
             params.headless = true;
         }
@@ -105,18 +116,6 @@ function loadEntries(file) {
         }
         return { url, script };
     });
-}
-
-/** 在（子集）列表内随机取址，且下标不与上一次相同 */
-function pickEntry(entries, lastIndex) {
-    if (entries.length === 1) {
-        return { index: 0, entry: entries[0] };
-    }
-    let idx;
-    do {
-        idx = Math.floor(Math.random() * entries.length);
-    } while (idx === lastIndex);
-    return { index: idx, entry: entries[idx] };
 }
 
 // ==================== 随机 UA ====================
@@ -237,8 +236,8 @@ function randomPointInRect(rect) {
     };
 }
 
-/** 轮询等待广告加载，命中后按配置概率决定是否点击；未命中或未抽中直接返回 */
-async function detectAndClickAd(page, params, wlog) {
+/** 轮询等待广告加载，命中后点击；超时或广告未进入视口则跳过 */
+async function waitForAdAndClick(page, params, wlog) {
     const deadline = Date.now() + params.adTimeoutSec * 1000;
     let rect = null;
 
@@ -254,11 +253,6 @@ async function detectAndClickAd(page, params, wlog) {
 
     if (!rect) {
         wlog(`   ⚠️ ${params.adTimeoutSec} 秒内未检测到广告，跳过点击`);
-        return false;
-    }
-
-    if (Math.random() >= params.clickProbability) {
-        wlog(`   🎲 广告已加载，本次不点击（点击率 ${(params.clickProbability * 100).toFixed(0)}%）`);
         return false;
     }
 
@@ -336,74 +330,110 @@ async function launchBrowser(pacUrl) {
     return b;
 }
 
-// ==================== 轮次循环 ====================
+// ==================== 调度循环 ====================
 
-async function roundLoop(entries, params) {
-    let lastIndex = -1;
-    let round = 0;
+function formatDay({ year, month, day }) {
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/** 队列为空时生成下一个美国东部日历日的访问时刻（只保留未来时刻） */
+function ensureQueue(state, params, now) {
+    while (state.events.length === 0) {
+        state.day = state.day ? nextDay(state.day) : etDayKey(now);
+        state.events = buildDayEvents(state.day.year, state.day.month, state.day.day, params.visitsPerDay)
+            .filter(t => t > now);
+        tslog(`📅 链接 #${state.index + 1} · ${formatDay(state.day)} 计划 ${state.events.length} 次访问`);
+    }
+}
+
+/** 分段休眠，期间响应停止信号 */
+async function sleepInterruptible(ms) {
+    let remaining = ms;
+    while (remaining > 0 && !stopping) {
+        const chunk = Math.min(remaining, SCHEDULE_SLEEP_CHUNK_MS);
+        await sleep(chunk);
+        remaining -= chunk;
+    }
+}
+
+/** 执行一次访问；click 为 true 时等待广告并点击，否则仅停留 5 秒 */
+async function visitOnce(state, params, click) {
+    const { entry } = state;
+    const linkNo = state.index + 1;
+
+    let proxy;
+    try {
+        proxy = await fetchNovProxy();
+    } catch (e) {
+        tslog(`⚠️  链接 #${linkNo} 获取代理失败: ${e.message}，跳过本次访问`);
+        return;
+    }
+
+    const ua = randomWindowsUA();
+    const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
+    tslog(`🔵 链接 #${linkNo} 开始访问 → ${entry.url} | 代理 ${proxy.host}:${proxy.port}${uaTag}`);
+
+    let context = null;
+    try {
+        browser = await launchBrowser(pacRef.pacUrlFor(proxy));
+
+        context = await createFreshContext(browser);
+        activeContexts.add(context);
+
+        const page = await context.newPage();
+
+        if (ua) await page.setUserAgent(ua).catch(() => {});
+        await page.setCacheEnabled(false).catch(() => {});
+        page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+        page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
+        await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
+
+        setupRequestHandler(page, entry, { log: tslog, served: false });
+
+        await page.goto(entry.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+
+        if (click) {
+            await waitForAdAndClick(page, params, tslog);
+        } else if (!stopping) {
+            tslog(`   🙈 本次不点击，停留 ${NON_CLICK_DWELL_MS / 1000} 秒`);
+            await sleep(NON_CLICK_DWELL_MS);
+        }
+
+        tslog(`✅ 链接 #${linkNo} 本次访问结束`);
+        console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} proxy=${proxy.host}:${proxy.port} click=${click ? 1 : 0}`);
+    } catch (e) {
+        tslog(`❌ 链接 #${linkNo} 访问异常: ${e.message}`);
+    } finally {
+        if (context) {
+            activeContexts.delete(context);
+            await context.close().catch(() => {});
+        }
+        if (browser) {
+            await browser.close().catch(() => {});
+            browser = null;
+        }
+    }
+}
+
+/** 每个链接独立排程，每次取最早到期的访问执行 */
+async function scheduleLoop(entries, params) {
+    const states = entries.map((entry, index) => ({ index, entry, events: [], day: null }));
 
     while (!stopping) {
-        round += 1;
-        const { index, entry } = pickEntry(entries, lastIndex);
-        lastIndex = index;
+        const now = Date.now();
+        for (const s of states) ensureQueue(s, params, now);
 
-        // 每轮启动浏览器前获取一个新代理；失败则跳过本轮
-        let proxy;
-        try {
-            proxy = await fetchNovProxy();
-        } catch (e) {
-            tslog(`⚠️  轮次 #${round} 获取代理失败: ${e.message}，跳过本轮`);
-            if (!stopping) {
-                tslog(`⏳ 等待 ${ROUND_WAIT_MS / 1000} 秒后重试`);
-                await sleep(ROUND_WAIT_MS);
-            }
+        states.sort((a, b) => a.events[0] - b.events[0]);
+        const next = states[0];
+        const wait = next.events[0] - Date.now();
+
+        if (wait > 0) {
+            await sleepInterruptible(wait);
             continue;
         }
 
-        const ua = randomWindowsUA();
-        const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
-        tslog(`🔵 轮次 #${round} 开始访问 → ${entry.url} | 代理 ${proxy.host}:${proxy.port}${uaTag}`);
-
-        let context = null;
-        try {
-            browser = await launchBrowser(pacRef.pacUrlFor(proxy));
-
-            context = await createFreshContext(browser);
-            activeContexts.add(context);
-
-            const page = await context.newPage();
-
-            if (ua) await page.setUserAgent(ua).catch(() => {});
-            await page.setCacheEnabled(false).catch(() => {});
-            page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
-            page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
-            await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
-
-            setupRequestHandler(page, entry, { log: tslog, served: false });
-
-            await page.goto(entry.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-
-            await detectAndClickAd(page, params, tslog);
-
-            tslog(`✅ 轮次 #${round} 结束`);
-            console.log(`ROUND_SUMMARY round=${round} url=${entry.url} proxy=${proxy.host}:${proxy.port}`);
-        } catch (e) {
-            tslog(`❌ 轮次 #${round} 异常: ${e.message}`);
-        } finally {
-            if (context) {
-                activeContexts.delete(context);
-                await context.close().catch(() => {});
-            }
-            if (browser) {
-                await browser.close().catch(() => {});
-                browser = null;
-            }
-        }
-
-        if (!stopping) {
-            tslog(`⏳ 等待 ${ROUND_WAIT_MS / 1000} 秒后进入下一轮`);
-            await sleep(ROUND_WAIT_MS);
-        }
+        next.events.shift();
+        await visitOnce(next, params, Math.random() < params.clickProbability);
     }
 }
 
@@ -414,15 +444,16 @@ async function run() {
     const entries = loadEntries(params.urlsFile);
     headlessFlag = params.headless;
 
-    console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 每轮换代理)...');
+    console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 美国作息调度)...');
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
-    console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}%`);
+    console.log(`📅 每链接日访问: ${params.visitsPerDay} 次（泊松分布 + 美国东部时间作息加权）`);
+    console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MS / 1000} 秒`);
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
-    console.log('📡 代理来源: NovProxy API（每轮启动浏览器前获取，仅 mnd 域名经 SOCKS5，其余直连）\n');
+    console.log('📡 代理来源: NovProxy API（每次访问启动浏览器前获取，仅 mnd 域名经 SOCKS5，其余直连）\n');
 
     pacRef = await startMndPac();
 
-    await roundLoop(entries, params);
+    await scheduleLoop(entries, params);
 
     tslog('🏁 已停止，正在收尾...');
 }
