@@ -37,7 +37,7 @@ COPY mondiad-urls.json ./
 #
 # 运行（参数通过环境变量覆盖，命令行参数优先级更高）:
 #   docker run -d --name=mondiad --restart=always \
-#     -e VISITS_PER_DAY=250 -e CLICK_RATE=0.2 \
+#     -e VISITS_PER_DAY=250 -e CLICK_RATE=0.3 \
 #     mondiad-visitor:latest
 #
 # 查看日志 / 停止:

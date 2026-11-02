@@ -4,7 +4,7 @@
  * 用法:
  *   node mondiad.js [--urls=./mondiad-urls.json]
  *     [--visits-per-day=250] [--ad-timeout-sec=60] [--after-click-sec=10]
- *     [--click-rate=0.2] [--headless]
+ *     [--click-rate=0.3] [--headless]
  *
  * 每个广告链接独立排程：日访问量服从泊松分布（默认 250），按美国东部时间的
  * 小时权重分配（凌晨稀少、晚间最高）。每次访问开始时先决定是否点击。
@@ -18,7 +18,7 @@ import { fileURLToPath } from 'url';
 import UserAgent from 'user-agents';
 import { fetchNovProxy } from './shared/proxy-utils.js';
 import { startMndPac, isMndHost } from './shared/mnd-pac.js';
-import { etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
+import { etParts, etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -31,10 +31,12 @@ const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
-// 每次访问开始即决定是否点击：约 20% 的访问等待广告并点击，其余仅停留 5 秒后关闭
+// 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
+const SCHEDULE_ENABLED = true;
+// 每次访问开始即决定是否点击：约 30% 的访问等待广告并点击，其余仅停留 20 秒后关闭
 const CLICK_PROBABILITY = 0.3;
 const VISITS_PER_DAY = 300;
-const NON_CLICK_DWELL_MS = 5000;
+const NON_CLICK_DWELL_MS = 20000;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
@@ -336,6 +338,23 @@ function formatDay({ year, month, day }) {
     return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
+/** 美国东部时间的日期+时刻，如 2026-10-31 22:15:03 ET */
+function formatEtDateTime(ms) {
+    const { year, month, day, hour, minute, second } = etParts(ms);
+    const pad = (v) => String(v).padStart(2, '0');
+    return `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)} ET`;
+}
+
+function formatDuration(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h} 小时 ${m} 分`;
+    if (m > 0) return `${m} 分 ${s} 秒`;
+    return `${s} 秒`;
+}
+
 /** 队列为空时生成下一个美国东部日历日的访问时刻（只保留未来时刻） */
 function ensureQueue(state, params, now) {
     while (state.events.length === 0) {
@@ -356,8 +375,8 @@ async function sleepInterruptible(ms) {
     }
 }
 
-/** 执行一次访问；click 为 true 时等待广告并点击，否则仅停留 5 秒 */
-async function visitOnce(state, params, click) {
+/** 执行一次访问；click 为 true 时等待广告并点击，否则仅停留 20 秒 */
+async function visitOnce(state, params, click, icon = '🔵') {
     const { entry } = state;
     const linkNo = state.index + 1;
 
@@ -371,7 +390,7 @@ async function visitOnce(state, params, click) {
 
     const ua = randomWindowsUA();
     const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
-    tslog(`🔵 链接 #${linkNo} 开始访问 → ${entry.url} | 代理 ${proxy.host}:${proxy.port}${uaTag}`);
+    tslog(`${icon} 链接 #${linkNo} 开始访问 → ${entry.url} | 代理 ${proxy.host}:${proxy.port}${uaTag}`);
 
     let context = null;
     try {
@@ -415,17 +434,21 @@ async function visitOnce(state, params, click) {
     }
 }
 
+/** 补齐队列并返回最早到期的访问 */
+function nextDue(states, params) {
+    const now = Date.now();
+    for (const s of states) ensureQueue(s, params, now);
+    states.sort((a, b) => a.events[0] - b.events[0]);
+    return { state: states[0], due: states[0].events[0], now };
+}
+
 /** 每个链接独立排程，每次取最早到期的访问执行 */
 async function scheduleLoop(entries, params) {
     const states = entries.map((entry, index) => ({ index, entry, events: [], day: null }));
 
     while (!stopping) {
-        const now = Date.now();
-        for (const s of states) ensureQueue(s, params, now);
-
-        states.sort((a, b) => a.events[0] - b.events[0]);
-        const next = states[0];
-        const wait = next.events[0] - Date.now();
+        const { state: next, due, now } = nextDue(states, params);
+        const wait = due - now;
 
         if (wait > 0) {
             await sleepInterruptible(wait);
@@ -434,6 +457,23 @@ async function scheduleLoop(entries, params) {
 
         next.events.shift();
         await visitOnce(next, params, Math.random() < params.clickProbability);
+
+        if (stopping) break;
+
+        const upcoming = nextDue(states, params);
+        tslog(`⏭️ 下一轮: 链接 #${upcoming.state.index + 1} → ${upcoming.state.entry.url} | ${formatEtDateTime(upcoming.due)}（约 ${formatDuration(upcoming.due - Date.now())}后）`);
+    }
+}
+
+/** 关闭计划时的直接轮询：按 1→2→…→N 顺序连续访问，无额外等待 */
+async function roundRobinLoop(entries, params) {
+    const states = entries.map((entry, index) => ({ index, entry }));
+    let cursor = 0;
+
+    while (!stopping) {
+        const state = states[cursor];
+        cursor = (cursor + 1) % states.length;
+        await visitOnce(state, params, Math.random() < params.clickProbability, '🔁');
     }
 }
 
@@ -444,16 +484,20 @@ async function run() {
     const entries = loadEntries(params.urlsFile);
     headlessFlag = params.headless;
 
-    console.log('🚀 启动 CloakBrowser (mondiad 访问器 · 美国作息调度)...');
+    console.log('🚀 启动 CloakBrowser (mondiad 访问器)...');
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
-    console.log(`📅 每链接日访问: ${params.visitsPerDay} 次（泊松分布 + 美国东部时间作息加权）`);
+    console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
     console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MS / 1000} 秒`);
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
     console.log('📡 代理来源: NovProxy API（每次访问启动浏览器前获取，仅 mnd 域名经 SOCKS5，其余直连）\n');
 
     pacRef = await startMndPac();
 
-    await scheduleLoop(entries, params);
+    if (SCHEDULE_ENABLED) {
+        await scheduleLoop(entries, params);
+    } else {
+        await roundRobinLoop(entries, params);
+    }
 
     tslog('🏁 已停止，正在收尾...');
 }
