@@ -250,25 +250,25 @@ export async function fetchNovProxy(apiUrl = NOVPROXY_API) {
 
     for (let attempt = 1; attempt <= NOVPROXY_ATTEMPTS; attempt++) {
         try {
-            const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(15000) });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const text = (await resp.text()).trim();
+            // const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(15000) });
+            // if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            // const text = (await resp.text()).trim();
 
             const candidates = [];
-            const seen = new Set();
-            for (const line of text.split(/\r?\n/).map(l => l.trim())) {
-                const match = line.match(/^([0-9a-zA-Z.-]+):(\d{1,5})$/);
-                if (!match) continue;
-                const port = parseInt(match[2], 10);
-                if (port < 1 || port > 65535) continue;
-                const key = `${match[1]}:${port}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                candidates.push({ host: match[1], port });
-            }
-            if (candidates.length === 0) {
-                throw new Error(`无法解析: ${text.slice(0, 80) || '空响应'}`);
-            }
+            // const seen = new Set();
+            // for (const line of text.split(/\r?\n/).map(l => l.trim())) {
+            //     const match = line.match(/^([0-9a-zA-Z.-]+):(\d{1,5})$/);
+            //     if (!match) continue;
+            //     const port = parseInt(match[2], 10);
+            //     if (port < 1 || port > 65535) continue;
+            //     const key = `${match[1]}:${port}`;
+            //     if (seen.has(key)) continue;
+            //     seen.add(key);
+            //     candidates.push({ host: match[1], port });
+            // }
+            // if (candidates.length === 0) {
+            //     throw new Error(`无法解析: ${text.slice(0, 80) || '空响应'}`);
+            // }
 
             //const pick = candidates[Math.floor(Math.random() * candidates.length)];
             const pick = {host:'104.233.202.50', port:'17893'}
