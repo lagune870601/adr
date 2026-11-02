@@ -270,7 +270,8 @@ export async function fetchNovProxy(apiUrl = NOVPROXY_API) {
                 throw new Error(`无法解析: ${text.slice(0, 80) || '空响应'}`);
             }
 
-            const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            //const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            const pick = {host:'104.233.202.50', port:'17893'}
             console.log(`   📡 代理池 ${candidates.length} 个，随机选择 ${pick.host}:${pick.port}`);
             return { host: pick.host, port: pick.port, url: `socks5://${pick.host}:${pick.port}` };
         } catch (e) {
