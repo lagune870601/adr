@@ -31,6 +31,8 @@ const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const VISITS_PER_DAY = 300;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
+// 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
+const SCHEDULE_ENABLED = true;
 
 // ==================== 日志 ====================
 
@@ -391,6 +393,18 @@ async function scheduleLoop(entries, params) {
     }
 }
 
+/** 关闭计划时的直接轮询：按 1→2→…→N 顺序连续访问，无额外等待 */
+async function roundRobinLoop(entries, params) {
+    const states = entries.map((entry, index) => ({ index, entry }));
+    let cursor = 0;
+
+    while (!stopping) {
+        const state = states[cursor];
+        cursor = (cursor + 1) % states.length;
+        await visitOnce(state, params);
+    }
+}
+
 // ==================== 主流程 ====================
 
 async function run() {
@@ -402,17 +416,21 @@ async function run() {
     headlessFlag = params.headless;
     targetHosts = [...new Set(targets.map(hostnameOf).filter(Boolean))];
 
-    console.log('🚀 启动 CloakBrowser (visit-link 访问器 · 美国作息调度)...');
+    console.log('🚀 启动 CloakBrowser (visit-link 访问器)...');
     console.log(`📋 目标链接: ${entries.length} 条 | 文件: ${params.urlsFile}`);
     console.log(`📋 社媒入口: ${socialUrls.length} 条 | 文件: ${params.socialFile}`);
-    console.log(`📅 每链接日访问: ${params.visitsPerDay} 次（泊松分布 + 美国东部时间作息加权）`);
+    console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
     console.log(`⏱️  点击延迟: ${CLICK_DELAY_MIN_MS / 1000}-${CLICK_DELAY_MAX_MS / 1000} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: 100%`);
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
     console.log(`📡 代理来源: NovProxy API（每次访问启动浏览器前获取，仅目标域名经 SOCKS5，其余中止）\n`);
 
     pacRef = await startTargetPac(targetHosts);
 
-    await scheduleLoop(entries, params);
+    if (SCHEDULE_ENABLED) {
+        await scheduleLoop(entries, params);
+    } else {
+        await roundRobinLoop(entries, params);
+    }
 
     tslog('🏁 已停止，正在收尾...');
 }
