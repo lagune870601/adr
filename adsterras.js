@@ -28,11 +28,11 @@ const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const CLICK_DELAY_MIN_MS = 1000;
 const CLICK_DELAY_MAX_MS = 3000;
-const AFTER_CLICK_SEC = 20;
-const VISITS_PER_DAY = 300;
+const AFTER_CLICK_SEC = 1;
+const VISITS_PER_DAY = 150;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 // 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
-const SCHEDULE_ENABLED = false;
+const SCHEDULE_ENABLED = true;
 
 // ==================== 日志 ====================
 
