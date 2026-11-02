@@ -1,0 +1,61 @@
+# ============================================================
+# adsterras.js 社媒入口点击访问器 Docker Image
+# 基础镜像: cloakhq/cloakbrowser (含 CloakBrowser/Chromium 运行环境)
+# 入口: adsterras.js
+# ============================================================
+
+FROM cloakhq/cloakbrowser:latest
+
+LABEL description="adsterras.js 社媒入口点击访问器"
+LABEL maintainer="dev"
+
+# 环境变量（代码内亦有默认值，运行时可用 -e 覆盖）
+ENV NODE_ENV=production
+
+# docker stop 时发送 SIGINT，触发脚本的清理逻辑（关闭浏览器、PAC、代理）
+STOPSIGNAL SIGINT
+
+# 工作目录
+WORKDIR /app
+
+# 复制依赖清单（利用 Docker 缓存层）
+COPY package.json package-lock.json ./
+
+# 安装生产依赖
+RUN npm install --omit=dev
+
+# 复制运行时所需文件（精简）
+COPY adsterras.js ./
+COPY shared/ ./shared/
+COPY visit-links.json ./
+COPY social-urls.json ./
+
+# ============================================================
+# 构建与运行
+#
+# 构建:
+#   docker build -f Dockerfile_adsterras -t adsterras-visitor:latest .
+#
+# 运行（参数通过环境变量覆盖，命令行参数优先级更高）:
+#   docker run -d --name=adsterras --restart=always \
+#     -e VISITS_PER_DAY=300 -e AFTER_CLICK_SEC=10 \
+#     adsterras-visitor:latest
+#
+# 查看日志 / 停止:
+#   docker logs -f adsterras
+#   docker stop adsterras
+#
+# 说明:
+#   SCHEDULE_ENABLED 为代码内常量（当前 false）：true 按美国东部作息计划访问，
+#   false 多链接轮流连续访问，修改后需重启容器生效。
+#
+# 可选：运行时用宿主机文件覆盖镜像内版本（调试/热更新，无需重建镜像）:
+#   docker run -d --name=adsterras --restart=always \
+#     -v /home/adsterras/adsterras.js:/app/adsterras.js \
+#     -v /home/adsterras/visit-links.json:/app/visit-links.json \
+#     -v /home/adsterras/social-urls.json:/app/social-urls.json \
+#     adsterras-visitor:latest
+# ============================================================
+
+# 启动访问器
+CMD ["node", "adsterras.js"]
