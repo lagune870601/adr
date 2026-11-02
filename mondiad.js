@@ -32,8 +32,8 @@ const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
 // 每次访问开始即决定是否点击：约 20% 的访问等待广告并点击，其余仅停留 5 秒后关闭
-const CLICK_PROBABILITY = 0.2;
-const VISITS_PER_DAY = 250;
+const CLICK_PROBABILITY = 0.3;
+const VISITS_PER_DAY = 300;
 const NON_CLICK_DWELL_MS = 5000;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 
