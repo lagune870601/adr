@@ -33,6 +33,8 @@ const VISITS_PER_DAY = 300;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 // 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
 const SCHEDULE_ENABLED = false;
+// 本地测试：点击后未进入目标站点时保持浏览器不关闭，便于排查（Ctrl+C 结束）
+const HOLD_ON_CLICK_FAILURE = true;
 
 // ==================== 日志 ====================
 
@@ -187,6 +189,9 @@ function setupRequestHandler(page, socialHost, targetHosts, targetUrl) {
             req.continue().catch(() => {});
             return;
         }
+        if (req.isNavigationRequest()) {
+            tslog(`   🚫 已中止导航: ${req.url()}`);
+        }
         req.abort().catch(() => {});
     });
 }
@@ -234,6 +239,10 @@ async function clickTargetLink(page, params, targetHosts) {
     const finalHost = hostnameOf(page.url());
     if (!matchesHost(finalHost, targetHosts)) {
         tslog(`   ⚠️ 点击后未进入目标站点（当前: ${page.url()}）`);
+        if (HOLD_ON_CLICK_FAILURE) {
+            tslog('   ⏸️ 保持浏览器打开以便排查，按 Ctrl+C 结束');
+            while (!stopping) await sleep(1000);
+        }
         return false;
     }
 
