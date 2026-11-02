@@ -275,7 +275,8 @@ async function launchBrowser(pacUrl) {
             '--disable-dev-shm-usage',
             '--disable-accelerated-2d-canvas',
             '--disable-gpu',
-            `--proxy-pac-url=${pacUrl}`,
+            // 本地测试：临时关闭代理
+            // `--proxy-pac-url=${pacUrl}`,
         ],
     });
     browser = b;
@@ -316,22 +317,23 @@ async function visitOnce(state, params) {
     const socialUrl = params.socialUrls[Math.floor(Math.random() * params.socialUrls.length)];
     const socialHost = hostnameOf(socialUrl);
 
-    let proxy;
-    try {
-        proxy = await fetchNovProxy();
-    } catch (e) {
-        tslog(`⚠️  链接 #${linkNo} 获取代理失败: ${e.message}，跳过本次访问`);
-        return;
-    }
+    // 本地测试：临时关闭代理，改为直连
+    // let proxy;
+    // try {
+    //     proxy = await fetchNovProxy();
+    // } catch (e) {
+    //     tslog(`⚠️  链接 #${linkNo} 获取代理失败: ${e.message}，跳过本次访问`);
+    //     return;
+    // }
 
     const ua = randomWindowsUA();
     const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
     tslog(`🔵 链接 #${linkNo} 开始访问 → ${entry.url}`);
-    tslog(`   社媒入口: ${socialUrl} | 代理 ${proxy.host}:${proxy.port}${uaTag}`);
+    tslog(`   社媒入口: ${socialUrl} | 代理 直连${uaTag}`);
 
     let context = null;
     try {
-        browser = await launchBrowser(pacRef.pacUrlFor(proxy));
+        browser = await launchBrowser(null);
 
         context = await createFreshContext(browser);
         activeContexts.add(context);
@@ -356,7 +358,7 @@ async function visitOnce(state, params) {
         }
 
         tslog(`✅ 链接 #${linkNo} 本次访问结束`);
-        console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} social=${socialUrl} proxy=${proxy.host}:${proxy.port} click=${clicked ? 1 : 0}`);
+        console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} social=${socialUrl} proxy=direct click=${clicked ? 1 : 0}`);
     } catch (e) {
         tslog(`❌ 链接 #${linkNo} 访问异常: ${e.message}`);
     } finally {
@@ -422,9 +424,12 @@ async function run() {
     console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
     console.log(`⏱️  点击延迟: ${CLICK_DELAY_MIN_MS / 1000}-${CLICK_DELAY_MAX_MS / 1000} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: 100%`);
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
-    console.log(`📡 代理来源: NovProxy API（每次访问启动浏览器前获取，仅目标域名经 SOCKS5，其余中止）\n`);
+    // 本地测试：临时关闭代理
+    // console.log(`📡 代理来源: NovProxy API（每次访问启动浏览器前获取，仅目标域名经 SOCKS5，其余中止）\n`);
 
-    pacRef = await startTargetPac(targetHosts);
+    // 本地测试：临时关闭代理
+    // pacRef = await startTargetPac(targetHosts);
+    console.log('📡 代理: 已关闭（本地测试直连）\n');
 
     if (SCHEDULE_ENABLED) {
         await scheduleLoop(entries, params);
