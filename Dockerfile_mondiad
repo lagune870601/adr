@@ -11,8 +11,16 @@ LABEL maintainer="dev"
 
 # 环境变量（代码内亦有默认值，运行时可用 -e 覆盖）
 ENV NODE_ENV=production
+# 每轮都会启动新浏览器，关闭每次启动的更新检查，避免额外网络请求和延迟
+ENV CLOAKBROWSER_AUTO_UPDATE=false
 
-# docker stop 时发送 SIGINT，触发脚本的清理逻辑（关闭浏览器、PAC、代理）
+# Windows 字体：从真实 Windows 的 C:\Windows\Fonts 复制到 windows-fonts/ 后构建
+# （字体文件不入库；至少包含 Segoe UI, Segoe UI Light, Calibri, Marlett,
+#   MS UI Gothic, Franklin Gothic, Consolas, Courier New）
+COPY windows-fonts/ /usr/local/share/fonts/windows/
+RUN fc-cache -f
+
+# docker stop 时发送 SIGINT，触发脚本的清理逻辑（关闭浏览器、代理上下文）
 STOPSIGNAL SIGINT
 
 # 工作目录

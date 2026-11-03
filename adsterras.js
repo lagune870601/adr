@@ -3,7 +3,7 @@
  *
  * 用法:
  *   node adsterras.js [--urls=./visit-links.json] [--social=./social-urls.json]
- *     [--visits-per-day=150] [--after-click-sec=1] [--headless]
+ *     [--visits-per-day=150] [--after-click-sec=2] [--headless]
  *
  * 每个目标链接独立排程：日访问量服从泊松分布，按美国东部时间作息加权。
  * 每轮访问使用全新的浏览器进程（随机 --fingerprint seed），保证轮与轮之间
@@ -29,7 +29,7 @@ const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
 const CLICK_DELAY_MIN_MS = 0;
 const CLICK_DELAY_MAX_MS = 0;
-const AFTER_CLICK_SEC = 1;
+const AFTER_CLICK_SEC = 2;
 const VISITS_PER_DAY = 150;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 // 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）

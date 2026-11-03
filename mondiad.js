@@ -8,16 +8,19 @@
  *
  * 每个广告链接独立排程：日访问量服从泊松分布（默认 250），按美国东部时间的
  * 小时权重分配（凌晨稀少、晚间最高）。每次访问开始时先决定是否点击。
- * 每次访问前从 NovProxy API 代理池随机取一个 SOCKS5 代理，并重启浏览器重新加载 PAC。
+ * 每轮访问使用全新的浏览器进程（随机 --fingerprint seed），保证轮与轮之间
+ * 指纹不可关联；轮内新建隐私上下文，并通过 createBrowserContext({ proxyServer })
+ * 为该上下文指定代理。访问前先用轻量 IP 接口确认出口 IP：若本次进程已使用过
+ * 则更换端点重试；达到尝试上限仍找不到未使用过的出口 IP 时，跳过本次访问。
+ * 下一轮浏览器在访问时刻前预热，启动开销落在轮间空档里。
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import UserAgent from 'user-agents';
-import { fetchNovProxy } from './shared/proxy-utils.js';
-import { startMndPac, isMndHost } from './shared/mnd-pac.js';
+import { fetchNovProxyList } from './shared/proxy-utils.js';
+import { isMndHost } from './shared/mnd-pac.js';
 import { etParts, etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -38,6 +41,27 @@ const CLICK_PROBABILITY = 0.3;
 const VISITS_PER_DAY = 300;
 const NON_CLICK_DWELL_MS = 20000;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
+
+// ==================== 代理与出口 IP ====================
+
+const PROXY_API_URL = 'https://white.novproxy.com/white/api?region=US&num=1000&time=1&format=1&type=txt';
+const PROXY_LIST_REFRESH_MS = 30 * 60 * 1000;
+// 端点碰撞后冷却：等它的出口 IP 轮换（time=1 约 1 分钟）
+const PROXY_COOLDOWN_MS = 60 * 1000;
+// 探测失败后的冷却，比碰撞短
+const PROBE_ERROR_COOLDOWN_MS = 15 * 1000;
+const PROBE_TIMEOUT_MS = 8000;
+const PROBE_CONCURRENCY = 3;
+const MAX_PROXY_ATTEMPTS = 6;
+const IP_PROBE_URLS = [
+    'https://icanhazip.com/',
+    'https://checkip.amazonaws.com/',
+    'https://api.ipify.org/',
+];
+const IPV4_RE = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+const STATS_LOG_EVERY = 20;
+// 下一轮浏览器在访问时刻前多少毫秒启动（启动实测约 2 秒）
+const PREWARM_LEAD_MS = 15000;
 
 // 省流：图片与广告上报（beacon/fetch/xhr）必须放行，否则广告不展示或点击不上报
 const BLOCKED_RESOURCE_TYPES = ['stylesheet', 'font', 'media', 'texttrack', 'manifest'];
@@ -118,16 +142,6 @@ function loadEntries(file) {
         }
         return { url, script };
     });
-}
-
-// ==================== 随机 UA ====================
-
-function randomWindowsUA() {
-    try {
-        return new UserAgent({ platform: 'Win32' }).toString();
-    } catch {
-        return null;
-    }
 }
 
 // ==================== 域名工具 ====================
@@ -291,45 +305,263 @@ async function waitForAdAndClick(page, params, wlog) {
     return true;
 }
 
-// ==================== 无痕上下文 ====================
+// ==================== 浏览器生命周期 ====================
 
-async function createFreshContext(browser) {
-    if (typeof browser.createBrowserContext === 'function') {
-        return browser.createBrowserContext();
-    }
-    if (typeof browser.createIncognitoBrowserContext === 'function') {
-        return browser.createIncognitoBrowserContext();
-    }
-    throw new Error('当前浏览器不支持创建无痕上下文');
-}
+const BASE_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+];
 
-// ==================== 浏览器 ====================
-
-let browser = null;
-let pacRef = null;
 let headlessFlag = isLinux;
 const activeContexts = new Set();
 let stopping = false;
 
-async function launchBrowser(pacUrl) {
+let prewarmedSlot = null;
+let prewarmPromise = null;
+let activeSlot = null;
+
+let proxyEndpoints = [];
+let proxyListFetchedAt = 0;
+const usedIPs = new Set();
+const proxyCooldown = new Map();
+const stats = { rounds: 0, skipped: 0, lastSeed: null };
+
+function endpointKey(ep) {
+    return `${ep.host}:${ep.port}`;
+}
+
+/**
+ * 启动一个全新的浏览器进程。每次启动随机生成指纹 seed，
+ * 该 seed 决定 canvas / WebGL / audio / GPU / 硬件参数等一整组指纹。
+ */
+async function launchFreshBrowser() {
+    const seed = 10000 + Math.floor(Math.random() * 90000);
     const b = await launch({
         headless: headlessFlag,
         humanize: true,
         timezone: 'America/New_York',
         locale: 'en-US',
-        viewport: { width: 1360, height: 768 },
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--disable-gpu',
-            `--proxy-pac-url=${pacUrl}`,
-        ],
+        args: [...BASE_ARGS, `--fingerprint=${seed}`],
     });
-    browser = b;
-    tslog('🧩 浏览器已就绪');
-    return b;
+    tslog(`🧩 浏览器已启动（seed=${seed}，本轮独立指纹）`);
+    return { browser: b, seed };
+}
+
+async function closeSlot(slot) {
+    if (slot && slot.browser) {
+        await slot.browser.close().catch(() => {});
+    }
+}
+
+/** 在下一访问时刻前启动下一轮浏览器，把启动耗时藏在轮间空档 */
+function startPrewarm() {
+    if (stopping || prewarmedSlot || prewarmPromise) return;
+    prewarmPromise = launchFreshBrowser()
+        .then(async (slot) => {
+            if (stopping) {
+                await closeSlot(slot);
+                return;
+            }
+            prewarmedSlot = slot;
+        })
+        .catch((e) => {
+            tslog(`⚠️  预启动浏览器失败: ${e.message}`);
+        })
+        .finally(() => {
+            prewarmPromise = null;
+        });
+}
+
+/** 取本轮浏览器：优先使用预热好的，否则现场启动 */
+async function takeBrowser() {
+    if (prewarmPromise) await prewarmPromise.catch(() => {});
+    const slot = prewarmedSlot;
+    prewarmedSlot = null;
+
+    if (slot) {
+        if (slot.browser.isConnected()) return slot;
+        await closeSlot(slot);
+    }
+    return launchFreshBrowser();
+}
+
+async function closePrewarmed() {
+    if (prewarmPromise) await prewarmPromise.catch(() => {});
+    const slot = prewarmedSlot;
+    prewarmedSlot = null;
+    if (slot) await closeSlot(slot);
+}
+
+async function createProxyContext(browser, proxyKey) {
+    if (typeof browser.createBrowserContext !== 'function') {
+        throw new Error('当前浏览器不支持 createBrowserContext');
+    }
+    return browser.createBrowserContext({ proxyServer: `socks5://${proxyKey}` });
+}
+
+// ==================== 代理列表 ====================
+
+async function ensureProxyList(force = false) {
+    if (!force && proxyEndpoints.length > 0 &&
+        Date.now() - proxyListFetchedAt < PROXY_LIST_REFRESH_MS) {
+        return;
+    }
+    try {
+        const list = await fetchNovProxyList(PROXY_API_URL);
+        proxyEndpoints = list;
+        proxyListFetchedAt = Date.now();
+        tslog(`📡 代理列表已缓存: ${list.length} 个端点`);
+    } catch (e) {
+        if (proxyEndpoints.length === 0) throw e;
+        tslog(`⚠️  代理列表刷新失败，继续使用旧列表: ${e.message}`);
+    }
+}
+
+function pickCandidateEndpoints(count, tried) {
+    const now = Date.now();
+    const pool = proxyEndpoints.filter(ep => {
+        const key = endpointKey(ep);
+        if (tried.has(key)) return false;
+        const until = proxyCooldown.get(key);
+        if (until && until > now) return false;
+        if (until) proxyCooldown.delete(key);
+        return true;
+    });
+
+    const picked = [];
+    while (picked.length < count && pool.length > 0) {
+        const idx = Math.floor(Math.random() * pool.length);
+        picked.push(pool[idx]);
+        pool.splice(idx, 1);
+    }
+    return picked;
+}
+
+// ==================== 出口 IP 探测 ====================
+
+async function probeEgressIP(page) {
+    for (const url of IP_PROBE_URLS) {
+        try {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PROBE_TIMEOUT_MS });
+            const text = await page.evaluate(() => (document.body ? document.body.innerText : ''));
+            const ip = text.trim().split(/\s+/)[0] || '';
+            if (IPV4_RE.test(ip)) return ip;
+        } catch {
+            // 尝试下一个探测接口
+        }
+    }
+    return null;
+}
+
+/** 读取本轮的 canvas 指纹哈希和 WebGL 可用性，仅用于日志验证 */
+async function readFingerprint(page) {
+    try {
+        return await page.evaluate(() => {
+            const c = document.createElement('canvas');
+            c.width = 300;
+            c.height = 80;
+            const ctx = c.getContext('2d');
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillStyle = '#f60';
+            ctx.fillRect(125, 1, 62, 20);
+            ctx.fillStyle = '#069';
+            ctx.font = '11pt "Segoe UI"';
+            ctx.fillText('Cwm fjordbank glyphs vext quiz, 😃', 2, 15);
+            const data = c.toDataURL();
+            let h = 0;
+            for (let i = 0; i < data.length; i++) h = (Math.imul(31, h) + data.charCodeAt(i)) | 0;
+
+            const glCanvas = document.createElement('canvas');
+            const gl = glCanvas.getContext('webgl2') || glCanvas.getContext('webgl');
+            return { fp: h, gl: gl ? 1 : 0 };
+        });
+    } catch {
+        return { fp: null, gl: null };
+    }
+}
+
+async function probeCandidate(browser, ep) {
+    const key = endpointKey(ep);
+    let ctx = null;
+    try {
+        ctx = await createProxyContext(browser, key);
+        activeContexts.add(ctx);
+
+        const page = await ctx.newPage();
+        await page.setCacheEnabled(false).catch(() => {});
+
+        const ip = await probeEgressIP(page);
+        return { key, ctx, page, ip };
+    } catch (e) {
+        if (ctx) {
+            activeContexts.delete(ctx);
+            await ctx.close().catch(() => {});
+        }
+        return { key, ctx: null, page: null, ip: null, error: e.message };
+    }
+}
+
+async function closeCandidate(c) {
+    if (c && c.ctx) {
+        activeContexts.delete(c.ctx);
+        await c.ctx.close().catch(() => {});
+    }
+}
+
+/**
+ * 在尝试上限内找到一个出口 IP 未被本进程使用过的上下文。
+ * 并行的候选会保留第一个命中者，其余关闭；碰撞端点冷却后重试。
+ * 找不到则返回 null（调用方跳过本轮）。
+ */
+async function acquireUniqueProxy(browser) {
+    const tried = new Set();
+    let attempts = 0;
+
+    while (attempts < MAX_PROXY_ATTEMPTS && !stopping) {
+        const batch = pickCandidateEndpoints(
+            Math.min(PROBE_CONCURRENCY, MAX_PROXY_ATTEMPTS - attempts), tried);
+        if (batch.length === 0) return null;
+
+        attempts += batch.length;
+        for (const ep of batch) tried.add(endpointKey(ep));
+
+        const results = await Promise.all(batch.map(ep => probeCandidate(browser, ep)));
+
+        if (stopping) {
+            await Promise.all(results.map(closeCandidate));
+            return null;
+        }
+
+        let winner = null;
+        for (const r of results) {
+            if (!r) continue;
+            if (!r.ip) {
+                proxyCooldown.set(r.key, Date.now() + PROBE_ERROR_COOLDOWN_MS);
+                await closeCandidate(r);
+                continue;
+            }
+            if (usedIPs.has(r.ip)) {
+                proxyCooldown.set(r.key, Date.now() + PROXY_COOLDOWN_MS);
+                await closeCandidate(r);
+                continue;
+            }
+            if (!winner) {
+                winner = r;
+                usedIPs.add(r.ip);
+            } else {
+                await closeCandidate(r);
+            }
+        }
+
+        if (winner) {
+            tslog(`   🌍 出口 IP: ${winner.ip} | 端点 ${winner.key}`);
+            return winner;
+        }
+        tslog(`   🔁 本批 ${batch.length} 个端点均不可用或出口 IP 重复，继续尝试`);
+    }
+
+    return null;
 }
 
 // ==================== 调度循环 ====================
@@ -375,37 +607,58 @@ async function sleepInterruptible(ms) {
     }
 }
 
+function finishRound(skipped) {
+    stats.rounds++;
+    if (skipped) stats.skipped++;
+    if (stats.rounds % STATS_LOG_EVERY === 0) {
+        tslog(`📊 统计: 完成 ${stats.rounds} 轮 | 跳过 ${stats.skipped} 轮 | ` +
+            `已用唯一 IP ${usedIPs.size} 个 | 冷却端点 ${proxyCooldown.size} 个 | ` +
+            `最近 seed ${stats.lastSeed ?? '-'}`);
+    }
+}
+
 /** 执行一次访问；click 为 true 时等待广告并点击，否则仅停留 20 秒 */
 async function visitOnce(state, params, click, icon = '🔵') {
     const { entry } = state;
     const linkNo = state.index + 1;
 
-    let proxy;
     try {
-        proxy = await fetchNovProxy();
+        await ensureProxyList();
     } catch (e) {
-        tslog(`⚠️  链接 #${linkNo} 获取代理失败: ${e.message}，跳过本次访问`);
+        tslog(`⚠️  链接 #${linkNo} 获取代理列表失败: ${e.message}，跳过本次访问`);
+        finishRound(true);
         return;
     }
 
-    const ua = randomWindowsUA();
-    const uaTag = ua ? ` | UA=${ua.split(') ').pop()}` : '';
-    tslog(`${icon} 链接 #${linkNo} 开始访问 → ${entry.url} | 代理 ${proxy.host}:${proxy.port}${uaTag}`);
-
-    let context = null;
+    let slot;
     try {
-        browser = await launchBrowser(pacRef.pacUrlFor(proxy));
+        slot = await takeBrowser();
+    } catch (e) {
+        tslog(`⚠️  链接 #${linkNo} 启动浏览器失败: ${e.message}，跳过本次访问`);
+        finishRound(true);
+        return;
+    }
+    activeSlot = slot;
+    stats.lastSeed = slot.seed;
 
-        context = await createFreshContext(browser);
-        activeContexts.add(context);
+    const picked = await acquireUniqueProxy(slot.browser);
+    if (!picked) {
+        tslog(`⏭️ 链接 #${linkNo} 跳过本次访问：未获取到未使用过的出口 IP`);
+        activeSlot = null;
+        await closeSlot(slot);
+        finishRound(true);
+        return;
+    }
 
-        const page = await context.newPage();
+    const { key, ctx, page, ip } = picked;
+    tslog(`${icon} 链接 #${linkNo} 开始访问 → ${entry.url}`);
+    tslog(`   端点 ${key} | 出口 IP ${ip} | seed ${slot.seed}`);
 
-        if (ua) await page.setUserAgent(ua).catch(() => {});
-        await page.setCacheEnabled(false).catch(() => {});
+    try {
+        const fpInfo = await readFingerprint(page);
+
         page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
         page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
-        await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
 
         setupRequestHandler(page, entry, { log: tslog, served: false });
 
@@ -419,18 +672,17 @@ async function visitOnce(state, params, click, icon = '🔵') {
         }
 
         tslog(`✅ 链接 #${linkNo} 本次访问结束`);
-        console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} proxy=${proxy.host}:${proxy.port} click=${click ? 1 : 0}`);
+        console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} ` +
+            `proxy=${key} ip=${ip} seed=${slot.seed} fp=${fpInfo.fp} gl=${fpInfo.gl} ` +
+            `click=${click ? 1 : 0}`);
     } catch (e) {
         tslog(`❌ 链接 #${linkNo} 访问异常: ${e.message}`);
     } finally {
-        if (context) {
-            activeContexts.delete(context);
-            await context.close().catch(() => {});
-        }
-        if (browser) {
-            await browser.close().catch(() => {});
-            browser = null;
-        }
+        activeContexts.delete(ctx);
+        await ctx.close().catch(() => {});
+        activeSlot = null;
+        await closeSlot(slot);
+        finishRound(false);
     }
 }
 
@@ -451,7 +703,13 @@ async function scheduleLoop(entries, params) {
         const wait = due - now;
 
         if (wait > 0) {
-            await sleepInterruptible(wait);
+            if (wait > PREWARM_LEAD_MS) {
+                await sleepInterruptible(wait - PREWARM_LEAD_MS);
+                if (stopping) break;
+            }
+            startPrewarm();
+            const remaining = due - Date.now();
+            if (remaining > 0) await sleepInterruptible(remaining);
             continue;
         }
 
@@ -488,10 +746,12 @@ async function run() {
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
     console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
     console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MS / 1000} 秒`);
+    console.log('🌍 出口策略: 每轮全新浏览器（独立 seed）+ 隐私上下文 + 出口 IP 去重（重复则跳过本次访问）');
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
-    console.log('📡 代理来源: NovProxy API（每次访问启动浏览器前获取，仅 mnd 域名经 SOCKS5，其余直连）\n');
+    console.log(`📡 代理来源: NovProxy API（启动缓存端点，每 ${PROXY_LIST_REFRESH_MS / 60000} 分钟刷新）`);
+    console.log(`🔥 预热: 访问时刻前 ${PREWARM_LEAD_MS / 1000} 秒启动下一轮浏览器\n`);
 
-    pacRef = await startMndPac();
+    await ensureProxyList(true);
 
     if (SCHEDULE_ENABLED) {
         await scheduleLoop(entries, params);
@@ -508,12 +768,12 @@ async function cleanup() {
         await c.close().catch(() => {});
     }
     activeContexts.clear();
-    if (browser) await browser.close().catch(() => {});
-    browser = null;
-    if (pacRef) {
-        pacRef.close();
-        pacRef = null;
+    if (activeSlot) {
+        const slot = activeSlot;
+        activeSlot = null;
+        await closeSlot(slot);
     }
+    await closePrewarmed();
 }
 
 process.on('SIGINT', () => {
