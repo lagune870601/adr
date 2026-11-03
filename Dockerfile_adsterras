@@ -46,7 +46,7 @@ COPY social-urls.json ./
 #   docker stop adsterras
 #
 # 说明:
-#   SCHEDULE_ENABLED 为代码内常量（当前 false）：true 按美国东部作息计划访问，
+#   SCHEDULE_ENABLED 为代码内常量（当前 true）：true 按美国东部作息计划访问，
 #   false 多链接轮流连续访问，修改后需重启容器生效。
 #
 # 可选：运行时用宿主机文件覆盖镜像内版本（调试/热更新，无需重建镜像）:
