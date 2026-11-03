@@ -250,27 +250,28 @@ export async function fetchNovProxy(apiUrl = NOVPROXY_API) {
 
     for (let attempt = 1; attempt <= NOVPROXY_ATTEMPTS; attempt++) {
         try {
-            const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(15000) });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const text = (await resp.text()).trim();
+            // const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(15000) });
+            // if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            // const text = (await resp.text()).trim();
 
-            const candidates = [];
-            const seen = new Set();
-            for (const line of text.split(/\r?\n/).map(l => l.trim())) {
-                const match = line.match(/^([0-9a-zA-Z.-]+):(\d{1,5})$/);
-                if (!match) continue;
-                const port = parseInt(match[2], 10);
-                if (port < 1 || port > 65535) continue;
-                const key = `${match[1]}:${port}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                candidates.push({ host: match[1], port });
-            }
-            if (candidates.length === 0) {
-                throw new Error(`无法解析: ${text.slice(0, 80) || '空响应'}`);
-            }
+            // const candidates = [];
+            // const seen = new Set();
+            // for (const line of text.split(/\r?\n/).map(l => l.trim())) {
+            //     const match = line.match(/^([0-9a-zA-Z.-]+):(\d{1,5})$/);
+            //     if (!match) continue;
+            //     const port = parseInt(match[2], 10);
+            //     if (port < 1 || port > 65535) continue;
+            //     const key = `${match[1]}:${port}`;
+            //     if (seen.has(key)) continue;
+            //     seen.add(key);
+            //     candidates.push({ host: match[1], port });
+            // }
+            // if (candidates.length === 0) {
+            //     throw new Error(`无法解析: ${text.slice(0, 80) || '空响应'}`);
+            // }
 
-            const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            // const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            const pick = {host:"172.17.0.1", port:"7891"}
             console.log(`   📡 代理池 ${candidates.length} 个，随机选择 ${pick.host}:${pick.port}`);
             return { host: pick.host, port: pick.port, url: `socks5://${pick.host}:${pick.port}` };
         } catch (e) {
