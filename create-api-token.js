@@ -57,9 +57,9 @@ export async function createApiTokenCrawler(task, proxy, cookies) {
             ]
         });
 
-        // 2. 打开账号页面（cookies 登录态，无需 CF 处理）
+        // 2. 打开账号页面（cookies 登录态，无需 CF 处理；开启省流量拦截）
         console.log('\n📦 步骤 1: 打开账号页面...');
-        const page = await openAccountPage(browser, proxy, cookies);
+        const page = await openAccountPage(browser, proxy, cookies, { blockResources: true });
 
         // 3. 跳转到 API 设置页面
         console.log(`\n🌐 步骤 2: 跳转到 API 设置页面...`);
