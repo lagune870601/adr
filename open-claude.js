@@ -1,5 +1,7 @@
 import { launch } from 'cloakbrowser/puppeteer';
 import os from 'os';
+import mysql from 'mysql2/promise';
+import { DB_CONFIG } from './shared/db.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const isLinux = os.platform() === 'linux';
@@ -9,6 +11,8 @@ const isLinux = os.platform() === 'linux';
 const LOGIN_URL = 'https://claude.ai/login';
 const TARGET_URL = 'https://claude.ai/new';
 
+const DEFAULT_ACCOUNT = 'rustic-meadow@md.qjwdzj.com';
+
 const PROXY = {
     url: 'socks5://chenchao:chenchao@104.233.202.50:17893',
     host: '104.233.202.50',
@@ -17,254 +21,20 @@ const PROXY = {
     password: 'chenchao',
 };
 
-// Chrome 扩展格式的 cookie（从浏览器导出，登录 claude.ai 的账号）
-const RAW_COOKIES = [
-    {
-        domain: '.claude.ai',
-        expirationDate: 1801964847.351691,
-        hostOnly: false,
-        httpOnly: false,
-        name: '_fbp',
-        path: '/',
-        sameSite: 'no_restriction',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: 'fb.1.1794188849642.73833429619725980',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1825744636.233221,
-        hostOnly: false,
-        httpOnly: false,
-        name: 'ajs_anonymous_id',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: 'claudeai.v1.0f628fb0-9a24-4c74-9748-b8e6827fdb18',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1825744637.175016,
-        hostOnly: false,
-        httpOnly: false,
-        name: 'CH-prefers-color-scheme',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: 'light',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1828748867.932851,
-        hostOnly: false,
-        httpOnly: false,
-        name: '__ssid',
-        path: '/',
-        sameSite: 'unspecified',
-        secure: false,
-        session: false,
-        storeId: '0',
-        value: '42fc1665-e329-4718-9b10-92720edb8a63',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1796608160.422847,
-        hostOnly: false,
-        httpOnly: true,
-        name: 'sessionKey',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: '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',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1796608160.422943,
-        hostOnly: false,
-        httpOnly: false,
-        name: 'sessionKeyLC',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: '1794188952062',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1825744637.173097,
-        hostOnly: false,
-        httpOnly: false,
-        name: 'lastActiveOrg',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: '333d80e8-6092-47ed-8a20-ac98acce9b8e',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1796780994.983694,
-        hostOnly: false,
-        httpOnly: true,
-        name: 'routingHint',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: 'sk-ant-rh-eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJFUzI1NiIsICJraWQiOiAiN0MxcWFPRnhqdWxaUjRFQnNuNk1UeUZGNWdDV2JHbFpNVDR2RklrRFFpbyJ9.eyJzdWIiOiAiM2FmMDkwZjUtNzY5OC00MWFkLTlhNWEtNzk0NjNkZDJmOTI0IiwgInYiOiAyLCAiaXNfdmVyaWZpZWQiOiB0cnVlLCAiaGFzX21lbWJlcnNoaXAiOiB0cnVlLCAib25ib2FyZGluZ19jb21wbGV0ZSI6IHRydWUsICJhZ2VfdmVyaWZpZWQiOiB0cnVlLCAicGVuZGluZ19pbnZpdGUiOiBmYWxzZSwgInBob25lX3ZlcmlmaWVkIjogZmFsc2UsICJuYW1lIjogInJ1c3RpYy1tZWFkb3ciLCAibG9jYWxlIjogImVuLVVTIiwgImZsYWdzIjogWyJlZGdlX2RlZmF1bHRfcm91dGUiXSwgImlhdCI6IDE3OTQxODg5OTcsICJpc3MiOiAiY2xhdWRlLWFpLXJvdXRpbmcifQ.ThKfGIpV69IueFTURaB8imMaVH99432q11syXWCotrrIFGQtzgSzayfbNAz6anWj4fi7Jizuu8fFDSRuZHWVtQ',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1801965000,
-        hostOnly: false,
-        httpOnly: false,
-        name: '_gcl_au',
-        path: '/',
-        sameSite: 'unspecified',
-        secure: false,
-        session: false,
-        storeId: '0',
-        value: '1.1.610061934.1794189000.-.-.1794189000.1637687392.1794189000.1794189000',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1825744638.887147,
-        hostOnly: false,
-        httpOnly: false,
-        name: 'user-sidebar-visible-on-load',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: 'true',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1796608160.422391,
-        hostOnly: false,
-        httpOnly: true,
-        name: 'sessionKeyV3',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: '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',
-    },
-    {
-        domain: '.claude.ai',
-        expirationDate: 1796608160.422584,
-        hostOnly: false,
-        httpOnly: false,
-        name: 'sessionKeyV3LC',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: '1794210563498',
-    },
-    {
-        domain: '.claude.ai',
-        hostOnly: false,
-        httpOnly: true,
-        name: '_cfuvid',
-        path: '/',
-        sameSite: 'no_restriction',
-        secure: true,
-        session: true,
-        storeId: '0',
-        value: 'kLLu5iwjxN6cf0MObwgtNheP57Srbs4URD4YGnGJRFk-1794212243.2941716-1.0.1.1-iqUngQ.Y.fowvd.5oBaQl0sbY54c.xChCJ.xi6TDwVs',
-    },
-    {
-        domain: 'claude.ai',
-        hostOnly: true,
-        httpOnly: true,
-        name: 'ion-vk',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: true,
-        storeId: '0',
-        value: '997fd45e-6953-4ef3-8548-e84f33c1be9e',
-    },
-    {
-        domain: 'claude.ai',
-        expirationDate: 1820128634.172828,
-        hostOnly: true,
-        httpOnly: false,
-        name: 'anthropic-device-id',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: '7eb87991-b95e-4272-8d54-884c1e43b900',
-    },
-    {
-        domain: 'claude.ai',
-        expirationDate: 1794251834.173038,
-        hostOnly: true,
-        httpOnly: false,
-        name: 'activitySessionId',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: 'dc50cfe7-bbdd-4f55-883a-8efc1ec1dcd2',
-    },
-    {
-        domain: 'claude.ai',
-        expirationDate: 1809740876,
-        hostOnly: true,
-        httpOnly: false,
-        name: 'g_state',
-        path: '/',
-        sameSite: 'unspecified',
-        secure: false,
-        session: false,
-        storeId: '0',
-        value: '{"i_l":0,"i_ll":1794188876938,"i_b":"4Vp5fljGLGOygO3HYuwKoD+ns9Pg5SpRStBX47F2K+U","i_e":{"enable_itp_optimization":24},"i_et":1794188876938}',
-    },
-    {
-        domain: 'claude.ai',
-        expirationDate: 1796800636.948255,
-        hostOnly: true,
-        httpOnly: false,
-        name: 'artifact-app-viewer',
-        path: '/',
-        sameSite: 'lax',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: '1',
-    },
-    {
-        domain: 'claude.ai',
-        expirationDate: 1825748255.148,
-        hostOnly: true,
-        httpOnly: false,
-        name: '_dd_s_v2',
-        path: '/',
-        sameSite: 'strict',
-        secure: true,
-        session: false,
-        storeId: '0',
-        value: 'aid=2779ab5e-4d1c-41fc-a970-afe8234b7936&id=006747ca-d4c4-4cc8-b2ba-a7cfcd7fca26&created=1794208228300&expire=1794213155148&c=0',
-    },
-];
+// ==================== 命令行参数解析 ====================
+
+function parseArgs() {
+    const args = process.argv.slice(2);
+    const params = { account: DEFAULT_ACCOUNT };
+
+    for (const arg of args) {
+        if (arg.startsWith('--account=')) {
+            params.account = arg.slice('--account='.length);
+        }
+    }
+
+    return params;
+}
 
 // ==================== Cookie 格式转换 ====================
 
@@ -303,21 +73,63 @@ function convertCookies(rawCookies) {
     });
 }
 
+// ==================== 数据库查询 ====================
+
+async function getAccountCookies(account) {
+    console.log(`🔍 查询账号: ${account}`);
+    const connection = await mysql.createConnection(DB_CONFIG);
+
+    try {
+        const [rows] = await connection.execute(
+            'SELECT account, cookies FROM claude_account WHERE account = ?',
+            [account]
+        );
+
+        if (rows.length === 0) {
+            console.warn(`⚠️  未找到账号 "${account}" 的记录`);
+            return null;
+        }
+
+        const record = rows[0];
+        console.log(`✅ 找到账号: ${record.account}`);
+
+        const rawCookies = typeof record.cookies === 'string'
+            ? JSON.parse(record.cookies)
+            : (record.cookies || []);
+
+        console.log(`🍪 原始 cookie 数量: ${rawCookies.length}`);
+
+        const cookies = convertCookies(rawCookies);
+        console.log(`🍪 转换后 cookie 数量: ${cookies.length}`);
+
+        return cookies;
+    } finally {
+        await connection.end();
+    }
+}
+
 // ==================== 主流程 ====================
 
 async function openClaude() {
+    const params = parseArgs();
     console.log('🚀 启动 CloakBrowser (Claude)...');
+    console.log(`👤 目标账号: ${params.account}\n`);
 
     let browser;
 
     try {
-        const cookies = convertCookies(RAW_COOKIES);
-        console.log(`🍪 待写入 cookie 数量: ${cookies.length}`);
+        // 步骤 1: 查询数据库获取 cookies
+        console.log('📦 步骤 1: 从数据库获取 cookies...');
+        const cookies = await getAccountCookies(params.account);
+
+        if (!cookies || cookies.length === 0) {
+            console.warn('⚠️  没有可用的 cookies，将尝试无 cookie 访问');
+        }
 
         const platform = os.platform();
         console.log(`🖥️  当前平台: ${platform} (${isLinux ? '无头模式' : '窗口模式'})`);
 
-        console.log('\n🌐 启动 CloakBrowser...');
+        console.log('\n🌐 步骤 2: 启动 CloakBrowser...');
         browser = await launch({
             headless: isLinux,
             proxy: PROXY.url,
@@ -348,8 +160,8 @@ async function openClaude() {
 
         await page.setViewport({ width: 1366, height: 768 });
 
-        // 步骤 1: 访问 login 页面建立 domain
-        console.log(`\n🌐 访问 ${LOGIN_URL} 建立 domain...`);
+        // 步骤 3: 访问 login 页面建立 domain
+        console.log(`\n🌐 步骤 3: 访问 ${LOGIN_URL} 建立 domain...`);
         try {
             await page.goto(LOGIN_URL, {
                 waitUntil: 'load',
@@ -363,14 +175,18 @@ async function openClaude() {
         await sleep(3000);
         console.log('✅ Domain 已建立');
 
-        // 步骤 2: 写入 cookies
-        console.log(`\n🍪 写入 ${cookies.length} 个 cookies...`);
-        await page.setCookie(...cookies);
-        const applied = await page.cookies();
-        console.log(`✅ Cookies 写入完成，当前域 cookie 数量: ${applied.length}`);
+        // 步骤 4: 写入 cookies
+        if (cookies && cookies.length > 0) {
+            console.log(`\n🍪 步骤 4: 写入 ${cookies.length} 个 cookies...`);
+            await page.setCookie(...cookies);
+            const applied = await page.cookies();
+            console.log(`✅ Cookies 写入完成，当前域 cookie 数量: ${applied.length}`);
+        } else {
+            console.log('\n🍪 步骤 4: 跳过（无可用 cookies）');
+        }
 
-        // 步骤 3: 跳转到新对话页面
-        console.log(`\n🌐 跳转 ${TARGET_URL} ...`);
+        // 步骤 5: 跳转到新对话页面
+        console.log(`\n🌐 步骤 5: 跳转 ${TARGET_URL} ...`);
         try {
             await page.goto(TARGET_URL, {
                 waitUntil: 'load',
