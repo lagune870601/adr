@@ -30,7 +30,7 @@ COPY urls.json ./
 
 # 可选：运行时用宿主机文件覆盖镜像内版本（调试/热更新，无需重建镜像）
 #   docker run -v "$(pwd)/adz.js:/app/adz.js" adz-visitor:latest
-#   docker run -v "$(pwd)/urls.json:/app/urls.json" adz-visitor:latest
+#   docker run -d -e CONCURRENCY=1 --name=adz --restart=always -v /home/adz/adz.js:/app/adz.js -v /home/adz/urls.json:/app/urls.json adz
 
 # 启动访问器
 CMD ["node", "adz.js"]
