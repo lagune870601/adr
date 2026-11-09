@@ -18,18 +18,11 @@ const AD_HTML = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<script>
-  atOptions = {
-    'key' : '2ca2cea932d0da388343ce66040275f3',
-    'format' : 'iframe',
-    'height' : 60,
-    'width' : 468,
-    'params' : {}
-  };
-</script>
-<script src="https://biomanos.org/22/2ca2cea932d0da388343ce66040275f3"></script>
+<script data-cfasync="false" src="https://benchform.org/1/7d8dafe22286c3310dfbe404472dd6ad"></script>
 </head>
-<body>helloworld</body>
+<body>helloworld1
+
+</body>
 </html>`;
 
 function tslog(msg) {
