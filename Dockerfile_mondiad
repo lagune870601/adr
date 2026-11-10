@@ -11,16 +11,8 @@ LABEL maintainer="dev"
 
 # 环境变量（代码内亦有默认值，运行时可用 -e 覆盖）
 ENV NODE_ENV=production
-# 每轮都会启动新浏览器，关闭每次启动的更新检查，避免额外网络请求和延迟
-ENV CLOAKBROWSER_AUTO_UPDATE=false
 
-# Windows 字体：从真实 Windows 的 C:\Windows\Fonts 复制到 windows-fonts/ 后构建
-# （字体文件不入库；至少包含 Segoe UI, Segoe UI Light, Calibri, Marlett,
-#   MS UI Gothic, Franklin Gothic, Consolas, Courier New）
-COPY windows-fonts/ /usr/local/share/fonts/windows/
-RUN fc-cache -f
-
-# docker stop 时发送 SIGINT，触发脚本的清理逻辑（关闭浏览器、代理上下文）
+# docker stop 时发送 SIGINT，触发脚本的清理逻辑（关闭浏览器、PAC、代理）
 STOPSIGNAL SIGINT
 
 # 工作目录
@@ -45,7 +37,7 @@ COPY mondiad-urls.json ./
 #
 # 运行（参数通过环境变量覆盖，命令行参数优先级更高）:
 #   docker run -d --name=mondiad --restart=always \
-#     -e VISITS_PER_DAY=250 -e CLICK_RATE=0.3 \
+#     -e CONCURRENCY=1 -e CLICK_RATE=0.2 \
 #     mondiad-visitor:latest
 #
 # 查看日志 / 停止:
@@ -54,9 +46,9 @@ COPY mondiad-urls.json ./
 #
 # 可选：运行时用宿主机文件覆盖镜像内版本（调试/热更新，无需重建镜像）:
 #   docker run -d --name=mondiad --restart=always \
-#     -v /home/mondiad/mondiad.js:/app/mondiad.js \
-#     -v /home/mondiad/mondiad-urls.json:/app/mondiad-urls.json \
-#     mondiad-visitor:latest
+     -v /home/mondiad/mondiad.js:/app/mondiad.js \
+     -v /home/mondiad/mondiad-urls.json:/app/mondiad-urls.json \
+     mondiad-visitor:latest
 # ============================================================
 
 # 启动访问器

@@ -11,9 +11,16 @@ import http from 'http';
 const PAC_HOST = '127.0.0.1';
 const PROXY_HOST_RE = /^[0-9a-zA-Z.-]+$/;
 
-/** 仅放行主机名包含 mnd 的域名（含子域名，大小写不敏感） */
+// 额外放行的域名：主机名不含 mnd，但广告素材需要加载
+const EXTRA_ALLOWED_HOSTS = new Set([
+    'icon.dt.ssnhmnc.com',
+]);
+
+/** 放行主机名包含 mnd 的域名，以及显式白名单中的域名（大小写不敏感） */
 export function isMndHost(host) {
-    return !!host && host.toLowerCase().includes('mnd');
+    if (!host) return false;
+    const h = host.toLowerCase();
+    return h.includes('mnd') || EXTRA_ALLOWED_HOSTS.has(h);
 }
 
 /**
@@ -33,8 +40,12 @@ export async function startMndPac() {
             return;
         }
 
+        const extraCond = [...EXTRA_ALLOWED_HOSTS]
+            .map(h => `host.toLowerCase() === '${h}'`)
+            .join(' || ');
+        const rule = `host.toLowerCase().indexOf('mnd') !== -1${extraCond ? ` || ${extraCond}` : ''}`;
         const pac = `function FindProxyForURL(url, host) {
-  if (host.toLowerCase().indexOf('mnd') !== -1) return 'SOCKS5 ${proxyHost}:${proxyPort}';
+  if (${rule}) return 'SOCKS5 ${proxyHost}:${proxyPort}';
   return 'DIRECT';
 }`;
 

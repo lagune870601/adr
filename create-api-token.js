@@ -6,8 +6,7 @@ import { openAccountPage } from './shared/open-account-utils.js';
 import { handleCookieDialog } from './shared/crawler-utils.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-// const isLinux = os.platform() === 'linux';
-const isLinux = false;
+const isLinux = os.platform() === 'linux';
 
 const API_SETTINGS_URL = 'https://beta.publishers.adsterra.com/settings?tab=API';
 
