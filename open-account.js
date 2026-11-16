@@ -16,7 +16,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'raycoleman@ym.cypi.fr';
+const DEFAULT_ACCOUNT = 'rachelfosterloveyou@getmail.my.id';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';

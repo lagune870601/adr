@@ -23,7 +23,7 @@ const ADSPOWER_API_KEY = '1bf5df8fe0c39df2d1c395dd9d45250600900ced223770de';
 
 // 固定代理配置（SOCKS5）
 const FIXED_PROXY_HOST = '104.233.202.50';
-const FIXED_PROXY_PORT = 7891;
+const FIXED_PROXY_PORT = 17893;
 const FIXED_PROXY_TYPE = 'socks5';
 
 // ==================== 工具函数 ====================
