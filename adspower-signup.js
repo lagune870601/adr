@@ -19,7 +19,7 @@ import { getTask, updateTaskStatus, incrementRetryCount } from './shared/db.js';
 // ==================== 配置 ====================
 
 const ADSPOWER_API = 'http://127.0.0.1:50325';
-const ADSPOWER_API_KEY = '1bf5df8fe0c39df2d1c395dd9d45250600900ced223770de';
+const ADSPOWER_API_KEY = 'ba609fbb951882c021f08fd7338054270090581adbbd2d62';
 
 // 固定代理配置（SOCKS5）
 const FIXED_PROXY_HOST = '104.233.202.50';
@@ -219,7 +219,7 @@ async function main() {
     // ─── 2. 创建新环境（带固定代理） ───
     // TODO: 临时使用固定环境 106 测试，测试完恢复 createProfile
     console.log('\n🔧 使用固定环境 106...');
-    const userId = 'k1fup52a'; // 临时：serial_number=105
+    const userId = 'k1j2cupc'; // 临时：serial_number=105
     console.log(`🎯 使用环境: user_id=${userId}`);
 
     // 构造代理对象（供 signupCrawler 的 page.authenticate 使用）
