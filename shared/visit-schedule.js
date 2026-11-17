@@ -12,6 +12,7 @@
 
 export const ET_TZ = 'America/New_York';
 export const JP_TZ = 'Asia/Tokyo';
+export const KR_TZ = 'Asia/Seoul';
 
 // 24 个小时的未归一化权重：凌晨 0-5 点合计约 5%，晚间 18-21 点每小时最高
 export const US_HOURLY_WEIGHTS = [
@@ -35,6 +36,17 @@ export const JP_HOURLY_WEIGHTS = [
     4.0, 4.5, 4.2, 4.5, 4.8, 4.8, 5.0, 5.2, // 10-17
     6.0, 6.5, 6.8, 7.0,                     // 18-21
     6.5, 5.0,                               // 22-23
+];
+
+// 韩国本地作息：深夜 22-01 点使用率高于日本，凌晨 3-5 点最低，
+// 白天平稳，晚间 19-21 点为高峰
+export const KR_HOURLY_WEIGHTS = [
+    1.8, 1.2, 0.8, 0.6, 0.5, 0.7,           // 0-5
+    1.2,                                    // 6
+    2.6, 3.4, 3.2,                          // 7-9
+    3.8, 4.2, 4.0, 4.2, 4.4, 4.5, 4.6, 4.8, // 10-17
+    5.4, 5.8, 6.4, 6.8,                     // 18-21
+    7.2, 5.5,                               // 22-23
 ];
 
 const fmtCache = new Map();

@@ -1,15 +1,16 @@
 /**
- * adsterras.js — 双班（美国 / 日本）随机访问社媒入口，返回本地空页面并点击目标链接
+ * adsterras.js — 三班（美国 / 日本 / 韩国）随机访问社媒入口，返回本地空页面并点击目标链接
  *
  * 用法:
  *   node adsterras.js [--urls=./visit-links.json] [--social=./social-urls.json]
- *     [--social-jp=./social-urls-jp.json]
- *     [--visits-per-day-us=150] [--visits-per-day-jp=150]
+ *     [--social-jp=./social-urls-jp.json] [--social-kr=./social-urls-kr.json]
+ *     [--visits-per-day-us=150] [--visits-per-day-jp=150] [--visits-per-day-kr=150]
  *     [--max-concurrency=4] [--after-click-sec=2] [--headless]
  *
- * 链接文件为 {"us": [...], "jp": [...]} 分组，两班各跑各的链接、互不交叉：
+ * 链接文件为 {"us": [...], "jp": [...], "kr": [...]} 分组，各班各跑各的链接、互不交叉：
  * 美国班使用美国代理 + America/New_York + 美国作息权重；
- * 日本班使用日本代理 + Asia/Tokyo + 日本作息权重。
+ * 日本班使用日本代理 + Asia/Tokyo + 日本作息权重；
+ * 韩国班使用韩国代理 + Asia/Seoul + 韩国作息权重。
  * 每条链接一个独立异步循环：日访问量服从泊松分布，按本地作息加权，
  * 到点各自启动全新浏览器（随机 --fingerprint seed），全局并发上限默认 4。
  * 每轮访问用全新浏览器进程 + 独立隐私上下文 + 上下文级 SOCKS5 代理；
@@ -25,7 +26,8 @@ import { fetchNovProxyList } from './shared/proxy-utils.js';
 import { matchesHost } from './shared/target-pac.js';
 import {
     tzDayKey, nextDay, buildDayEvents,
-    US_HOURLY_WEIGHTS, JP_HOURLY_WEIGHTS,
+    US_HOURLY_WEIGHTS, JP_HOURLY_WEIGHTS, KR_HOURLY_WEIGHTS,
+    JP_TZ, KR_TZ,
 } from './shared/visit-schedule.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -95,10 +97,13 @@ function parseArgs() {
         urlsFile: path.join(__dirname, 'visit-links.json'),
         socialFile: path.join(__dirname, 'social-urls.json'),
         socialJpFile: path.join(__dirname, 'social-urls-jp.json'),
+        socialKrFile: path.join(__dirname, 'social-urls-kr.json'),
         afterClickSec: parseNonNegativeFloat(process.env.AFTER_CLICK_SEC, AFTER_CLICK_SEC),
         visitsPerDayUs: parsePositiveInt(process.env.VISITS_PER_DAY_US,
             parsePositiveInt(envVisits, VISITS_PER_DAY)),
         visitsPerDayJp: parsePositiveInt(process.env.VISITS_PER_DAY_JP,
+            parsePositiveInt(envVisits, VISITS_PER_DAY)),
+        visitsPerDayKr: parsePositiveInt(process.env.VISITS_PER_DAY_KR,
             parsePositiveInt(envVisits, VISITS_PER_DAY)),
         maxConcurrency: parsePositiveInt(process.env.MAX_CONCURRENCY, MAX_CONCURRENCY),
         headless: isLinux,
@@ -111,6 +116,8 @@ function parseArgs() {
             params.socialFile = arg.slice('--social='.length);
         } else if (arg.startsWith('--social-jp=')) {
             params.socialJpFile = arg.slice('--social-jp='.length);
+        } else if (arg.startsWith('--social-kr=')) {
+            params.socialKrFile = arg.slice('--social-kr='.length);
         } else if (arg.startsWith('--after-click-sec=')) {
             const v = parseFloat(arg.slice('--after-click-sec='.length));
             if (Number.isFinite(v) && v >= 0) params.afterClickSec = v;
@@ -120,11 +127,15 @@ function parseArgs() {
         } else if (arg.startsWith('--visits-per-day-jp=')) {
             const v = parseInt(arg.slice('--visits-per-day-jp='.length), 10);
             if (Number.isInteger(v) && v > 0) params.visitsPerDayJp = v;
+        } else if (arg.startsWith('--visits-per-day-kr=')) {
+            const v = parseInt(arg.slice('--visits-per-day-kr='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.visitsPerDayKr = v;
         } else if (arg.startsWith('--visits-per-day=')) {
             const v = parseInt(arg.slice('--visits-per-day='.length), 10);
             if (Number.isInteger(v) && v > 0) {
                 params.visitsPerDayUs = v;
                 params.visitsPerDayJp = v;
+                params.visitsPerDayKr = v;
             }
         } else if (arg.startsWith('--max-concurrency=')) {
             const v = parseInt(arg.slice('--max-concurrency='.length), 10);
@@ -176,7 +187,7 @@ function loadUrlList(file, label) {
     return validateUrlArray(arr, label);
 }
 
-/** 读取 {"us":[...], "jp":[...]} 分组；旧版纯数组按 us 处理 */
+/** 读取 {"us":[...], "jp":[...], "kr":[...]} 分组；旧版纯数组按 us 处理 */
 function loadUrlGroups(file) {
     if (!fs.existsSync(file)) {
         throw new Error(`目标链接文件不存在: ${file}`);
@@ -190,14 +201,15 @@ function loadUrlGroups(file) {
 
     if (Array.isArray(data)) {
         console.log(`⚠️  目标链接文件为旧版数组格式，按 us 处理: ${file}`);
-        return { us: validateUrlArray(data, '目标链接(us)'), jp: [] };
+        return { us: validateUrlArray(data, '目标链接(us)'), jp: [], kr: [] };
     }
     if (!data || typeof data !== 'object') {
-        throw new Error(`目标链接文件必须是 {"us":[...],"jp":[...]} 或数组: ${file}`);
+        throw new Error(`目标链接文件必须是 {"us":[...],"jp":[...],"kr":[...]} 或数组: ${file}`);
     }
     return {
         us: data.us === undefined ? [] : validateUrlArray(data.us, '目标链接(us)'),
         jp: data.jp === undefined ? [] : validateUrlArray(data.jp, '目标链接(jp)'),
+        kr: data.kr === undefined ? [] : validateUrlArray(data.kr, '目标链接(kr)'),
     };
 }
 
@@ -807,6 +819,9 @@ async function run() {
     const socialsJp = groups.jp.length > 0
         ? loadUrlList(params.socialJpFile, '社媒入口(JP)')
         : [];
+    const socialsKr = groups.kr.length > 0
+        ? loadUrlList(params.socialKrFile, '社媒入口(KR)')
+        : [];
 
     headlessFlag = params.headless;
     slotPool.limit = params.maxConcurrency;
@@ -816,23 +831,34 @@ async function run() {
         US_HOURLY_WEIGHTS, groups.us, socialsUs, params.visitsPerDayUs,
     )];
     if (groups.jp.length === 0) {
-        console.log('⚠️  日本班链接为空（visit-links.json 的 jp 数组），本次只运行美国班');
+        console.log('⚠️  日本班链接为空（visit-links.json 的 jp 数组），跳过日本班');
     } else {
         shifts.push(makeShift(
-            'jp', 'JP', 'Asia/Tokyo', 'ja-JP',
+            'jp', 'JP', JP_TZ, 'ja-JP',
             JP_HOURLY_WEIGHTS, groups.jp, socialsJp, params.visitsPerDayJp,
         ));
     }
+    if (groups.kr.length === 0) {
+        console.log('⚠️  韩国班链接为空（visit-links.json 的 kr 数组），跳过韩国班');
+    } else {
+        shifts.push(makeShift(
+            'kr', 'KR', KR_TZ, 'ko-KR',
+            KR_HOURLY_WEIGHTS, groups.kr, socialsKr, params.visitsPerDayKr,
+        ));
+    }
 
-    console.log('🚀 启动 CloakBrowser (adsterras 双班社媒点击访问器)...');
+    console.log(`🚀 启动 CloakBrowser (adsterras ${shifts.length} 班社媒点击访问器)...`);
     for (const s of shifts) {
         console.log(`📋 [${tag(s)}] 目标链接 ${s.links.length} 条 | 代理 region=${s.region} | ` +
             `时区 ${s.tz} | 语言 ${s.locale} | 日均 ${s.visitsPerDay}/链接`);
     }
     console.log(`📋 链接文件: ${params.urlsFile}`);
     console.log(`📋 社媒入口(US): ${socialsUs.length} 条 | 文件: ${params.socialFile}`);
-    if (shifts.length > 1) {
+    if (groups.jp.length > 0) {
         console.log(`📋 社媒入口(JP): ${socialsJp.length} 条 | 文件: ${params.socialJpFile}`);
+    }
+    if (groups.kr.length > 0) {
+        console.log(`📋 社媒入口(KR): ${socialsKr.length} 条 | 文件: ${params.socialKrFile}`);
     }
     console.log(`🔀 访问计划: ${SCHEDULE_ENABLED
         ? '开启（每条链接按本班本地作息独立排程）'
