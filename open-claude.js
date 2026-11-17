@@ -11,7 +11,7 @@ const isLinux = os.platform() === 'linux';
 const LOGIN_URL = 'https://claude.ai/login';
 const TARGET_URL = 'https://claude.ai/new';
 
-const DEFAULT_ACCOUNT = 'sandra@md.qjwdzj.com';
+const DEFAULT_ACCOUNT = 'crisp-falcon@md.qjwdzj.com';
 
 const PROXY = {
     url: 'socks5://chenchao:chenchao@104.233.202.50:17893',

@@ -529,7 +529,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
             try {
                 await page.goto('https://adsterra.com', {
                     waitUntil: 'load',
-                    timeout: 120000
+                    timeout: 1200000
                 });
             } catch (e) {
                 // 如果 load 事件也超时，先检查页面是否已有内容
@@ -1245,7 +1245,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                         // 步骤 8: 密码输入框固定输入 "123456789_Chen"
                         console.log('\n🔐 步骤 8: 输入固定密码...');
 
-                        const password = '123456789_Chen';
+                        const password = '877246531997_Chen';
                         await targetPage.click('#password-password');
                         await targetPage.type('#password-password', password, { delay: 50 });
                         await sleep(300);
@@ -1548,6 +1548,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                                 // 按 Enter 键
                                                 await yopmailPage.keyboard.press('Enter');
                                                 console.log('   ✅ 已按 Enter，进入邮箱');
+                                                await sleep(10000)
                                                 break;
                                             }
                                         }
