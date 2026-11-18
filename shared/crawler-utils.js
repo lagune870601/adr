@@ -9,6 +9,36 @@
 
 export const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// ==================== 省流量：请求拦截 ====================
+
+/**
+ * 拦截无关资源类型（图片/字体/CSS/媒体等），直接 abort 以节省流量。
+ * 必须在页面导航前调用；script/xhr/fetch/document 不受影响。
+ *
+ * @param {Page} page - Puppeteer 页面对象
+ * @param {string[]} blockedTypes - 要拦截的 resourceType 列表
+ */
+export async function setupRequestBlocker(page, blockedTypes = [
+    'image',
+    'font',
+    'stylesheet',
+    'media',
+    'texttrack',
+    'manifest',
+]) {
+    await page.setRequestInterception(true);
+
+    page.on('request', (request) => {
+        if (blockedTypes.includes(request.resourceType())) {
+            request.abort().catch(() => {});
+        } else {
+            request.continue().catch(() => {});
+        }
+    });
+
+    console.log(`   🚫 省流量模式: 已拦截 ${blockedTypes.join(', ')}`);
+}
+
 // ==================== Cloudflare Turnstile 反检测与交互 ====================
 
 /**

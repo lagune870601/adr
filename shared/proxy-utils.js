@@ -191,9 +191,9 @@ export async function createProxyFromAPI(options = {}) {
 
 // ──────────────────────── 固定代理 ────────────────────────
 
-const FIXED_PROXY_URL = 'socks5://chenchao:chenchao@104.233.202.50:17891';
+const FIXED_PROXY_URL = 'socks5://chenchao:chenchao@104.233.202.50:17893';
 const FIXED_PROXY_HOST = '104.233.202.50';
-const FIXED_PROXY_PORT = 17891;
+const FIXED_PROXY_PORT = 17893;
 const FIXED_NAME = "chenchao";
 const FIXED_PWD = "chenchao";
 
@@ -230,4 +230,90 @@ export async function createProxy(_options = {}) {
     };
 
     return { proxy, manager };
+}
+
+// ──────────────────────── NovProxy API ────────────────────────
+
+const NOVPROXY_API = 'https://white.novproxy.com/white/api?region=US&num=100&time=1&format=1&type=txt';
+const NOVPROXY_ATTEMPTS = 3;
+
+/**
+ * 从 NovProxy API 获取代理池并随机选一个免认证 SOCKS5 代理。
+ * API 对相同参数返回固定端点，故一次取多个（num=100）再随机挑选，
+ * 保证每轮浏览器启动时尽量使用不同的出口。调用方 IP 必须在白名单中。
+ *
+ * @param {string} [apiUrl] - 覆盖 API 地址（测试用）
+ * @returns {Promise<{host: string, port: number, url: string}>}
+ */
+export async function fetchNovProxy(apiUrl = NOVPROXY_API) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= NOVPROXY_ATTEMPTS; attempt++) {
+        try {
+            // const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(15000) });
+            // if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            // const text = (await resp.text()).trim();
+
+            // const candidates = [];
+            // const seen = new Set();
+            // for (const line of text.split(/\r?\n/).map(l => l.trim())) {
+            //     const match = line.match(/^([0-9a-zA-Z.-]+):(\d{1,5})$/);
+            //     if (!match) continue;
+            //     const port = parseInt(match[2], 10);
+            //     if (port < 1 || port > 65535) continue;
+            //     const key = `${match[1]}:${port}`;
+            //     if (seen.has(key)) continue;
+            //     seen.add(key);
+            //     candidates.push({ host: match[1], port });
+            // }
+            // if (candidates.length === 0) {
+            //     throw new Error(`无法解析: ${text.slice(0, 80) || '空响应'}`);
+            // }
+
+            // const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            const pick = { host: '172.17.0.1', port: 7891 };
+            console.log(`   📡 使用本地代理 ${pick.host}:${pick.port}`);
+            return { host: pick.host, port: pick.port, url: `socks5://${pick.host}:${pick.port}` };
+        } catch (e) {
+            lastError = e;
+            if (attempt < NOVPROXY_ATTEMPTS) {
+                const delay = 1000 * attempt;
+                console.log(`   🔄 获取代理失败（${e.message}），${delay / 1000}s 后重试...`);
+                await new Promise(r => setTimeout(r, delay));
+            }
+        }
+    }
+
+    throw new Error(`获取代理失败: ${lastError.message}`);
+}
+
+/**
+ * 获取 NovProxy 代理端点列表（去重、保持原顺序）。
+ * 接口对固定参数返回固定列表，可由调用方缓存后随机挑选。
+ *
+ * @param {string} [apiUrl]
+ * @returns {Promise<{host: string, port: number}[]>}
+ */
+export async function fetchNovProxyList(apiUrl = NOVPROXY_API) {
+    const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(20000) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+
+    const list = [];
+    const seen = new Set();
+    for (const line of text.split(/\r?\n/)) {
+        const match = line.trim().match(/^([0-9a-zA-Z.-]+):(\d{1,5})$/);
+        if (!match) continue;
+        const port = parseInt(match[2], 10);
+        if (port < 1 || port > 65535) continue;
+        const key = `${match[1]}:${port}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        list.push({ host: match[1], port });
+    }
+
+    if (list.length === 0) {
+        throw new Error(`无法解析代理列表: ${text.slice(0, 80) || '空响应'}`);
+    }
+    return list;
 }

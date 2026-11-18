@@ -13,7 +13,11 @@
     "advanced": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node advanced.js",
     "visit": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node redirect-visitor.js",
     "visit:test": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test-redirect-visitor.js",
-    "form:test": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test-form.js"
+    "form:test": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test-form.js",
+    "signup:adz": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node signup_adz.js",
+    "test:signup-adz:unit": "node test-signup-adz-unit.js",
+    "test:signup-adz:dry": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test-signup-adz.js --dry-run",
+    "test:signup-adz": "CLOAKBROWSER_BINARY_PATH=/workspace/.cloakbrowser/chrome node test-signup-adz.js"
   },
   "dependencies": {
     "cloakbrowser": "^0.5.7",

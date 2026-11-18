@@ -56,7 +56,7 @@ export async function createLinkCrawler(task, proxy, cookies) {
 
         // 2. 打开账号页面
         console.log('\n📦 步骤 1: 打开账号页面...');
-        const page = await openAccountPage(browser, proxy, cookies);
+        const page = await openAccountPage(browser, proxy, cookies, { blockResources: true });
 
         // 3. 跳转到 links 页面
         console.log(`\n🌐 步骤 2: 跳转到 links 页面...`);

@@ -1,3 +1,5 @@
+import { setupRequestBlocker } from './crawler-utils.js';
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const WEBSITES_URL = 'https://beta.publishers.adsterra.com/websites';
@@ -12,11 +14,17 @@ const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
  * @param {Browser} browser - 已启动的 CloakBrowser 实例
  * @param {object} proxy - { host, port, username, password }
  * @param {Array<object>} cookies - Puppeteer setCookie 格式的 cookie 数组
+ * @param {object} [options] - { blockResources?: boolean } 是否拦截图片/字体/CSS 等省流量
  * @returns {Promise<Page>} 已打开 websites 页面的 page 对象
  */
-export async function openAccountPage(browser, proxy, cookies) {
+export async function openAccountPage(browser, proxy, cookies, options = {}) {
     console.log('📖 创建新页面...');
     const page = await browser.newPage();
+
+    // 导航前开启省流量拦截
+    if (options.blockResources) {
+        await setupRequestBlocker(page);
+    }
 
     // 代理认证
     await page.authenticate({
