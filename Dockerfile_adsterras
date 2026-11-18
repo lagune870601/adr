@@ -37,6 +37,8 @@ COPY adsterras.js ./
 COPY shared/ ./shared/
 COPY visit-links.json ./
 COPY social-urls.json ./
+COPY social-urls-jp.json ./
+COPY social-urls-kr.json ./
 
 # ============================================================
 # 构建与运行
@@ -46,7 +48,8 @@ COPY social-urls.json ./
 #
 # 运行（参数通过环境变量覆盖，命令行参数优先级更高）:
 #   docker run -d --name=adsterras --restart=always \
-#     -e VISITS_PER_DAY=300 -e AFTER_CLICK_SEC=10 \
+#     -e VISITS_PER_DAY_US=150 -e VISITS_PER_DAY_JP=150 -e VISITS_PER_DAY_KR=150 \
+#     -e AFTER_CLICK_SEC=10 -e MAX_CONCURRENCY=4 \
 #     adsterras-visitor:latest
 #
 # 查看日志 / 停止:
@@ -54,14 +57,20 @@ COPY social-urls.json ./
 #   docker stop adsterras
 #
 # 说明:
-#   SCHEDULE_ENABLED 为代码内常量（当前 true）：true 按美国东部作息计划访问，
-#   false 多链接轮流连续访问，修改后需重启容器生效。
+#   visit-links.json 为 {"us":[...],"jp":[...],"kr":[...]} 分组：美国班跑 us 链接
+#   （美国代理 + America/New_York + 美国作息），日本班跑 jp 链接
+#   （日本代理 + Asia/Tokyo + 日本作息），韩国班跑 kr 链接
+#   （韩国代理 + Asia/Seoul + 韩国作息）。jp/kr 为空时跳过对应班次。
+#   SCHEDULE_ENABLED 为代码内常量（当前 true）：true 按各班本地作息计划访问，
+#   false 每条链接连续访问，修改后需重启容器生效。
 #
 # 可选：运行时用宿主机文件覆盖镜像内版本（调试/热更新，无需重建镜像）:
 #   docker run -d --name=adsterras --restart=always \
 #     -v /home/adsterras/adsterras.js:/app/adsterras.js \
 #     -v /home/adsterras/visit-links.json:/app/visit-links.json \
 #     -v /home/adsterras/social-urls.json:/app/social-urls.json \
+#     -v /home/adsterras/social-urls-jp.json:/app/social-urls-jp.json \
+#     -v /home/adsterras/social-urls-kr.json:/app/social-urls-kr.json \
 #     adsterras-visitor:latest
 # ============================================================
 

@@ -460,6 +460,11 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
     console.log(`👤 姓名: ${task.username}`);
     console.log(`📧 邮箱: ${task.email}`);
 
+    const pwd = task.pwd == null ? '' : String(task.pwd);
+    if (!pwd.trim()) {
+        return { success: false, retryable: false, error: '任务缺少密码 pwd' };
+    }
+
     // 以 username 为基准生成登录名称
     const loginName = task.username.replace(/\s+/g, '').toLowerCase() + Math.random().toString(36).substring(2, 6);
     console.log(`🔑 登录名: ${loginName}\n`);
@@ -529,7 +534,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
             try {
                 await page.goto('https://adsterra.com', {
                     waitUntil: 'load',
-                    timeout: 120000
+                    timeout: 1200000
                 });
             } catch (e) {
                 // 如果 load 事件也超时，先检查页面是否已有内容
@@ -872,8 +877,19 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                             console.log('📸 当前页面截图已保存：step5-no-cookie-banner.png');
                         }
 
-                        // 步骤 5.5: 填写姓名、邮箱和登录名称
-                        console.log('\n📝 步骤 5.5: 填写姓名、邮箱和登录名称...');
+                        // 步骤 5.5: 早期 Cloudflare 检测（未通过直接换代理重试）
+                        console.log('\n🛡️  步骤 5.5: 检测 Cloudflare 挑战...');
+                        const cfEarly = await waitForCloudflareChallenge(targetPage, 90000);
+                        if (cfEarly !== 'success') {
+                            console.log(`💀 Cloudflare 挑战未通过 (${cfEarly})，返回重试。`);
+                            await targetPage.screenshot({ path: `step5-cloudflare-${cfEarly}.png`, fullPage: true });
+                            if (!isExternalBrowser) await browser.close();
+                            return { success: false, retryable: true, error: `Cloudflare 挑战未通过 (${cfEarly})` };
+                        }
+                        console.log('🎉 Cloudflare 挑战通过！');
+
+                        // 步骤 5.6: 填写姓名、邮箱和登录名称
+                        console.log('\n📝 步骤 5.6: 填写姓名、邮箱和登录名称...');
 
                         // 填写姓名
                         const nameSelectors = [
@@ -1242,16 +1258,16 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                         const countryValue = await targetPage.$eval(countryInputSelector, el => el.value);
                         console.log(`   ✅ 国家: "${countryValue}"`);
 
-                        // 步骤 8: 密码输入框固定输入 "123456789_Chen"
-                        console.log('\n🔐 步骤 8: 输入固定密码...');
+                        // 步骤 8: 使用任务密码输入
+                        console.log('\n🔐 步骤 8: 输入任务密码...');
 
-                        const password = '123456789_Chen';
+                        const password = pwd;
                         await targetPage.click('#password-password');
                         await targetPage.type('#password-password', password, { delay: 50 });
                         await sleep(300);
 
                         const pwValue = await targetPage.$eval('#password-password', el => el.value);
-                        console.log(`   ✅ 密码: "${pwValue}"${pwValue === password ? ' ✔' : ' ✗'}`);
+                        console.log(`   ✅ 密码已输入 (${pwValue.length} 字符)${pwValue === password ? ' ✔' : ' ✗'}`);
 
                         // 步骤 9: 勾选同意隐私协议
                         console.log('\n📜 步骤 9: 勾选同意隐私协议...');
@@ -1274,11 +1290,11 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
 
                         if (cfResult === 'success') {
                             console.log('🎉 Cloudflare 挑战成功！页面已通过验证，可以正常访问。');
-                        } else if (cfResult === 'failed') {
-                            console.log('💀 Cloudflare 挑战失败！页面被拦截，无法继续。');
                         } else {
-                            console.log('⚠️  Cloudflare 挑战超时，可能影响后续操作，但继续执行...');
-                            await targetPage.screenshot({ path: 'step10-cloudflare-timeout.png', fullPage: true });
+                            console.log(`💀 Cloudflare 挑战未通过 (${cfResult})，返回重试。`);
+                            await targetPage.screenshot({ path: `step10-cloudflare-${cfResult}.png`, fullPage: true });
+                            if (!isExternalBrowser) await browser.close();
+                            return { success: false, retryable: true, error: `Cloudflare 挑战未通过 (${cfResult})` };
                         }
 
                         // 步骤 11: 确认 SIGN UP 按钮是否可点击，若可点击则提交注册
@@ -1351,8 +1367,8 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                 const nowBeijing = new Date(new Date().getTime() + 8 * 60 * 60 * 1000)
                                     .toISOString().slice(0, 19).replace('T', ' ');
                                 await dbConn.execute(
-                                    'INSERT INTO adsterra_account (account, status, create_time) VALUES (?, ?, ?)',
-                                    [task.email, 'SIGN_UP_SUCCESS', nowBeijing]
+                                    'INSERT INTO adsterra_account (account, status, create_time, pwd) VALUES (?, ?, ?, ?)',
+                                    [task.email, 'SIGN_UP_SUCCESS', nowBeijing, pwd]
                                 );
                                 console.log(`   ✅ 已插入: account="${task.email}", status=SIGN_UP_SUCCESS, create_time=${nowBeijing}`);
                                 await dbConn.end();
@@ -1548,6 +1564,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                                 // 按 Enter 键
                                                 await yopmailPage.keyboard.press('Enter');
                                                 console.log('   ✅ 已按 Enter，进入邮箱');
+                                                await sleep(10000)
                                                 break;
                                             }
                                         }

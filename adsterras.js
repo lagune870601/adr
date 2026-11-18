@@ -1,16 +1,21 @@
 /**
- * adsterras.js — 随机访问美国社媒入口，返回本地空页面并点击配置的目标链接
+ * adsterras.js — 三班（美国 / 日本 / 韩国）随机访问社媒入口，返回本地空页面并点击目标链接
  *
  * 用法:
  *   node adsterras.js [--urls=./visit-links.json] [--social=./social-urls.json]
- *     [--visits-per-day=150] [--after-click-sec=2] [--headless]
+ *     [--social-jp=./social-urls-jp.json] [--social-kr=./social-urls-kr.json]
+ *     [--visits-per-day-us=150] [--visits-per-day-jp=150] [--visits-per-day-kr=150]
+ *     [--max-concurrency=4] [--after-click-sec=2] [--headless]
  *
- * 每个目标链接独立排程：日访问量服从泊松分布，按美国东部时间作息加权。
- * 每轮访问使用全新的浏览器进程（随机 --fingerprint seed），保证轮与轮之间
- * 指纹不可关联；轮内新建隐私上下文，并通过 createBrowserContext({ proxyServer })
- * 为该上下文指定代理。访问前先用轻量 IP 接口确认出口 IP：若本次进程已使用过
- * 则更换端点重试；达到尝试上限仍找不到未使用过的出口 IP 时，跳过本轮访问。
- * 下一轮浏览器在访问时刻前预热，启动开销落在轮间空档里。
+ * 链接文件为 {"us": [...], "jp": [...], "kr": [...]} 分组，各班各跑各的链接、互不交叉：
+ * 美国班使用美国代理 + America/New_York + 美国作息权重；
+ * 日本班使用日本代理 + Asia/Tokyo + 日本作息权重；
+ * 韩国班使用韩国代理 + Asia/Seoul + 韩国作息权重。
+ * 每条链接一个独立异步循环：日访问量服从泊松分布，按本地作息加权，
+ * 到点各自启动全新浏览器（随机 --fingerprint seed），全局并发上限默认 4。
+ * 每轮访问用全新浏览器进程 + 独立隐私上下文 + 上下文级 SOCKS5 代理；
+ * 访问前先用轻量 IP 接口确认出口 IP：若本次进程已使用过则更换端点重试；
+ * 达到尝试上限仍找不到未使用过的出口 IP 时，跳过本轮访问。
  */
 
 import { launch } from 'cloakbrowser/puppeteer';
@@ -19,7 +24,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { fetchNovProxyList } from './shared/proxy-utils.js';
 import { matchesHost } from './shared/target-pac.js';
-import { etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
+import {
+    tzDayKey, nextDay, buildDayEvents,
+    US_HOURLY_WEIGHTS, JP_HOURLY_WEIGHTS, KR_HOURLY_WEIGHTS,
+    JP_TZ, KR_TZ,
+} from './shared/visit-schedule.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -32,12 +41,15 @@ const CLICK_DELAY_MAX_MS = 0;
 const AFTER_CLICK_SEC = 2;
 const VISITS_PER_DAY = 150;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
-// 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
+const MAX_CONCURRENCY = 4;
+// 访问计划开关：true 按各班的本地作息计划访问，false 每条链接连续访问（改后重启生效）
 const SCHEDULE_ENABLED = true;
 
 // ==================== 代理与出口 IP ====================
 
-const PROXY_API_URL = 'https://white.novproxy.com/white/api?region=US&num=1000&time=1&format=1&type=txt';
+const PROXY_API_URL = (region) =>
+    `https://white.novproxy.com/white/api?region=${encodeURIComponent(region)}` +
+    '&num=1000&time=1&format=1&type=txt';
 const PROXY_LIST_REFRESH_MS = 30 * 60 * 1000;
 // 端点碰撞后冷却：等它的出口 IP 轮换（time=1 约 1 分钟）
 const PROXY_COOLDOWN_MS = 60 * 1000;
@@ -53,7 +65,7 @@ const IP_PROBE_URLS = [
 ];
 const IPV4_RE = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 const STATS_LOG_EVERY = 20;
-// 下一轮浏览器在访问时刻前多少毫秒启动（启动实测约 2 秒）
+// 每条链接在访问时刻前多少毫秒启动浏览器（启动实测约 2 秒）
 const PREWARM_LEAD_MS = 15000;
 
 // ==================== 日志 ====================
@@ -63,19 +75,37 @@ function tslog(msg) {
     console.log(`[${t}] ${msg}`);
 }
 
+const tag = (shift) => shift.name.toUpperCase();
+
 // ==================== 命令行参数 ====================
+
+function parsePositiveInt(v, fallback) {
+    const n = parseInt(v, 10);
+    return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function parseNonNegativeFloat(v, fallback) {
+    const n = parseFloat(v);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
 
 function parseArgs() {
     const args = process.argv.slice(2);
 
-    const envAfterClick = parseFloat(process.env.AFTER_CLICK_SEC);
-    const envVisits = parseInt(process.env.VISITS_PER_DAY, 10);
-
+    const envVisits = process.env.VISITS_PER_DAY;
     const params = {
         urlsFile: path.join(__dirname, 'visit-links.json'),
         socialFile: path.join(__dirname, 'social-urls.json'),
-        afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
-        visitsPerDay: Number.isInteger(envVisits) && envVisits > 0 ? envVisits : VISITS_PER_DAY,
+        socialJpFile: path.join(__dirname, 'social-urls-jp.json'),
+        socialKrFile: path.join(__dirname, 'social-urls-kr.json'),
+        afterClickSec: parseNonNegativeFloat(process.env.AFTER_CLICK_SEC, AFTER_CLICK_SEC),
+        visitsPerDayUs: parsePositiveInt(process.env.VISITS_PER_DAY_US,
+            parsePositiveInt(envVisits, VISITS_PER_DAY)),
+        visitsPerDayJp: parsePositiveInt(process.env.VISITS_PER_DAY_JP,
+            parsePositiveInt(envVisits, VISITS_PER_DAY)),
+        visitsPerDayKr: parsePositiveInt(process.env.VISITS_PER_DAY_KR,
+            parsePositiveInt(envVisits, VISITS_PER_DAY)),
+        maxConcurrency: parsePositiveInt(process.env.MAX_CONCURRENCY, MAX_CONCURRENCY),
         headless: isLinux,
     };
 
@@ -84,12 +114,32 @@ function parseArgs() {
             params.urlsFile = arg.slice('--urls='.length);
         } else if (arg.startsWith('--social=')) {
             params.socialFile = arg.slice('--social='.length);
+        } else if (arg.startsWith('--social-jp=')) {
+            params.socialJpFile = arg.slice('--social-jp='.length);
+        } else if (arg.startsWith('--social-kr=')) {
+            params.socialKrFile = arg.slice('--social-kr='.length);
         } else if (arg.startsWith('--after-click-sec=')) {
             const v = parseFloat(arg.slice('--after-click-sec='.length));
             if (Number.isFinite(v) && v >= 0) params.afterClickSec = v;
+        } else if (arg.startsWith('--visits-per-day-us=')) {
+            const v = parseInt(arg.slice('--visits-per-day-us='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.visitsPerDayUs = v;
+        } else if (arg.startsWith('--visits-per-day-jp=')) {
+            const v = parseInt(arg.slice('--visits-per-day-jp='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.visitsPerDayJp = v;
+        } else if (arg.startsWith('--visits-per-day-kr=')) {
+            const v = parseInt(arg.slice('--visits-per-day-kr='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.visitsPerDayKr = v;
         } else if (arg.startsWith('--visits-per-day=')) {
             const v = parseInt(arg.slice('--visits-per-day='.length), 10);
-            if (Number.isInteger(v) && v > 0) params.visitsPerDay = v;
+            if (Number.isInteger(v) && v > 0) {
+                params.visitsPerDayUs = v;
+                params.visitsPerDayJp = v;
+                params.visitsPerDayKr = v;
+            }
+        } else if (arg.startsWith('--max-concurrency=')) {
+            const v = parseInt(arg.slice('--max-concurrency='.length), 10);
+            if (Number.isInteger(v) && v > 0) params.maxConcurrency = v;
         } else if (arg === '--headless') {
             params.headless = true;
         }
@@ -99,6 +149,27 @@ function parseArgs() {
 }
 
 // ==================== 数据列表 ====================
+
+function normalizeUrl(item, label, i) {
+    const url = typeof item === 'string' ? item.trim() : '';
+    let parsed = null;
+    try {
+        parsed = new URL(url);
+    } catch {
+        parsed = null;
+    }
+    if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+        throw new Error(`${label}第 ${i + 1} 项不是有效的 http(s) URL`);
+    }
+    return url;
+}
+
+function validateUrlArray(arr, label) {
+    if (!Array.isArray(arr)) {
+        throw new Error(`${label}必须是数组`);
+    }
+    return arr.map((item, i) => normalizeUrl(item, label, i));
+}
 
 function loadUrlList(file, label) {
     if (!fs.existsSync(file)) {
@@ -113,19 +184,33 @@ function loadUrlList(file, label) {
     if (!Array.isArray(arr) || arr.length === 0) {
         throw new Error(`${label}必须是非空数组: ${file}`);
     }
-    return arr.map((item, i) => {
-        const url = typeof item === 'string' ? item.trim() : '';
-        let parsed = null;
-        try {
-            parsed = new URL(url);
-        } catch {
-            parsed = null;
-        }
-        if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
-            throw new Error(`${label}第 ${i + 1} 项不是有效的 http(s) URL`);
-        }
-        return url;
-    });
+    return validateUrlArray(arr, label);
+}
+
+/** 读取 {"us":[...], "jp":[...], "kr":[...]} 分组；旧版纯数组按 us 处理 */
+function loadUrlGroups(file) {
+    if (!fs.existsSync(file)) {
+        throw new Error(`目标链接文件不存在: ${file}`);
+    }
+    let data;
+    try {
+        data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    } catch (e) {
+        throw new Error(`目标链接文件不是合法 JSON: ${e.message}`);
+    }
+
+    if (Array.isArray(data)) {
+        console.log(`⚠️  目标链接文件为旧版数组格式，按 us 处理: ${file}`);
+        return { us: validateUrlArray(data, '目标链接(us)'), jp: [], kr: [] };
+    }
+    if (!data || typeof data !== 'object') {
+        throw new Error(`目标链接文件必须是 {"us":[...],"jp":[...],"kr":[...]} 或数组: ${file}`);
+    }
+    return {
+        us: data.us === undefined ? [] : validateUrlArray(data.us, '目标链接(us)'),
+        jp: data.jp === undefined ? [] : validateUrlArray(data.jp, '目标链接(jp)'),
+        kr: data.kr === undefined ? [] : validateUrlArray(data.kr, '目标链接(kr)'),
+    };
 }
 
 // ==================== 域名工具 ====================
@@ -163,7 +248,7 @@ function buildHtml(targetUrl) {
 /**
  * 主 frame 导航到社媒域名时返回本地空页面；
  * 同域名的其余请求（如 favicon.ico）一律中止；
- * 目标链接域名（含子域名）的请求全部放行（经该上下文的代理）；
+ * 本班目标链接域名（含子域名）的请求全部放行（经该上下文的代理）；
  * 其余域名一律中止。
  */
 function setupRequestHandler(page, socialHost, targetHosts, targetUrl) {
@@ -208,7 +293,7 @@ function setupRequestHandler(page, socialHost, targetHosts, targetUrl) {
 
 // ==================== 点击目标链接 ====================
 
-async function clickTargetLink(page, params) {
+async function clickTargetLink(page) {
     let anchor;
     try {
         anchor = await page.waitForSelector('body a[href]', { timeout: DEFAULT_TIMEOUT_MS });
@@ -259,38 +344,44 @@ const BASE_ARGS = [
 ];
 
 let headlessFlag = isLinux;
-let targetHosts = [];
-const activeContexts = new Set();
 let stopping = false;
 
-let prewarmedSlot = null;
-let prewarmPromise = null;
-let activeSlot = null;
+const activeSlots = new Set();
+const activeContexts = new Set();
 
-let proxyEndpoints = [];
-let proxyListFetchedAt = 0;
-const usedIPs = new Set();
-const proxyCooldown = new Map();
-const stats = { rounds: 0, skipped: 0, lastSeed: null };
+// 并发槽位：全局最多同时运行 slotPool.limit 个浏览器，超出的循环轮询等待
+const slotPool = { limit: MAX_CONCURRENCY, active: 0 };
 
-function endpointKey(ep) {
-    return `${ep.host}:${ep.port}`;
+async function acquireSlot() {
+    while (!stopping) {
+        if (slotPool.active < slotPool.limit) {
+            slotPool.active++;
+            return true;
+        }
+        await sleep(200);
+    }
+    return false;
+}
+
+function releaseSlot() {
+    slotPool.active = Math.max(0, slotPool.active - 1);
 }
 
 /**
  * 启动一个全新的浏览器进程。每次启动随机生成指纹 seed，
- * 该 seed 决定 canvas / WebGL / audio / GPU / 硬件参数等一整组指纹。
+ * 该 seed 决定 canvas / WebGL / audio / GPU / 硬件参数等一整组指纹；
+ * 时区与语言跟随班次。
  */
-async function launchFreshBrowser() {
+async function launchFreshBrowser(shift) {
     const seed = 10000 + Math.floor(Math.random() * 90000);
     const b = await launch({
         headless: headlessFlag,
         humanize: true,
-        timezone: 'America/New_York',
-        locale: 'en-US',
+        timezone: shift.tz,
+        locale: shift.locale,
         args: [...BASE_ARGS, `--fingerprint=${seed}`],
     });
-    tslog(`🧩 浏览器已启动（seed=${seed}，本轮独立指纹）`);
+    tslog(`🧩 [${tag(shift)}] 浏览器已启动（seed=${seed}，时区 ${shift.tz}，本轮独立指纹）`);
     return { browser: b, seed };
 }
 
@@ -300,45 +391,6 @@ async function closeSlot(slot) {
     }
 }
 
-/** 在下一访问时刻前启动下一轮浏览器，把启动耗时藏在轮间空档 */
-function startPrewarm() {
-    if (stopping || prewarmedSlot || prewarmPromise) return;
-    prewarmPromise = launchFreshBrowser()
-        .then(async (slot) => {
-            if (stopping) {
-                await closeSlot(slot);
-                return;
-            }
-            prewarmedSlot = slot;
-        })
-        .catch((e) => {
-            tslog(`⚠️  预启动浏览器失败: ${e.message}`);
-        })
-        .finally(() => {
-            prewarmPromise = null;
-        });
-}
-
-/** 取本轮浏览器：优先使用预热好的，否则现场启动 */
-async function takeBrowser() {
-    if (prewarmPromise) await prewarmPromise.catch(() => {});
-    const slot = prewarmedSlot;
-    prewarmedSlot = null;
-
-    if (slot) {
-        if (slot.browser.isConnected()) return slot;
-        await closeSlot(slot);
-    }
-    return launchFreshBrowser();
-}
-
-async function closePrewarmed() {
-    if (prewarmPromise) await prewarmPromise.catch(() => {});
-    const slot = prewarmedSlot;
-    prewarmedSlot = null;
-    if (slot) await closeSlot(slot);
-}
-
 async function createProxyContext(browser, proxyKey) {
     if (typeof browser.createBrowserContext !== 'function') {
         throw new Error('当前浏览器不支持 createBrowserContext');
@@ -346,27 +398,55 @@ async function createProxyContext(browser, proxyKey) {
     return browser.createBrowserContext({ proxyServer: `socks5://${proxyKey}` });
 }
 
-// ==================== 代理列表 ====================
+// ==================== 代理列表（按区域隔离） ====================
 
-async function ensureProxyList(force = false) {
-    if (!force && proxyEndpoints.length > 0 &&
-        Date.now() - proxyListFetchedAt < PROXY_LIST_REFRESH_MS) {
+const proxyPools = new Map();
+const proxyCooldown = new Map();
+const usedIPs = new Set();
+
+function getProxyPool(region) {
+    let pool = proxyPools.get(region);
+    if (!pool) {
+        pool = { endpoints: [], fetchedAt: 0, inflight: null };
+        proxyPools.set(region, pool);
+    }
+    return pool;
+}
+
+/** 拉取/刷新某区域的代理端点列表；并发调用共享同一次请求 */
+async function ensureProxyList(region, force = false) {
+    const pool = getProxyPool(region);
+    if (!force && pool.endpoints.length > 0 &&
+        Date.now() - pool.fetchedAt < PROXY_LIST_REFRESH_MS) {
         return;
     }
+    if (pool.inflight) {
+        await pool.inflight;
+        return;
+    }
+
+    pool.inflight = (async () => {
+        try {
+            const list = await fetchNovProxyList(PROXY_API_URL(region));
+            pool.endpoints = list;
+            pool.fetchedAt = Date.now();
+            tslog(`📡 [${region}] 代理列表已缓存: ${list.length} 个端点`);
+        } catch (e) {
+            if (pool.endpoints.length === 0) throw e;
+            tslog(`⚠️  [${region}] 代理列表刷新失败，继续使用旧列表: ${e.message}`);
+        }
+    })();
+
     try {
-        const list = await fetchNovProxyList(PROXY_API_URL);
-        proxyEndpoints = list;
-        proxyListFetchedAt = Date.now();
-        tslog(`📡 代理列表已缓存: ${list.length} 个端点`);
-    } catch (e) {
-        if (proxyEndpoints.length === 0) throw e;
-        tslog(`⚠️  代理列表刷新失败，继续使用旧列表: ${e.message}`);
+        await pool.inflight;
+    } finally {
+        pool.inflight = null;
     }
 }
 
-function pickCandidateEndpoints(count, tried) {
+function pickCandidateEndpoints(region, count, tried) {
     const now = Date.now();
-    const pool = proxyEndpoints.filter(ep => {
+    const pool = getProxyPool(region).endpoints.filter(ep => {
         const key = endpointKey(ep);
         if (tried.has(key)) return false;
         const until = proxyCooldown.get(key);
@@ -382,6 +462,10 @@ function pickCandidateEndpoints(count, tried) {
         pool.splice(idx, 1);
     }
     return picked;
+}
+
+function endpointKey(ep) {
+    return `${ep.host}:${ep.port}`;
 }
 
 // ==================== 出口 IP 探测 ====================
@@ -460,13 +544,13 @@ async function closeCandidate(c) {
  * 并行的候选会保留第一个命中者，其余关闭；碰撞端点冷却后重试。
  * 找不到则返回 null（调用方跳过本轮）。
  */
-async function acquireUniqueProxy(browser) {
+async function acquireUniqueProxy(browser, region) {
     const tried = new Set();
     let attempts = 0;
 
     while (attempts < MAX_PROXY_ATTEMPTS && !stopping) {
         const batch = pickCandidateEndpoints(
-            Math.min(PROBE_CONCURRENCY, MAX_PROXY_ATTEMPTS - attempts), tried);
+            region, Math.min(PROBE_CONCURRENCY, MAX_PROXY_ATTEMPTS - attempts), tried);
         if (batch.length === 0) return null;
 
         attempts += batch.length;
@@ -510,19 +594,43 @@ async function acquireUniqueProxy(browser) {
     return null;
 }
 
-// ==================== 调度循环 ====================
+// ==================== 统计 ====================
+
+const shiftStats = new Map();
+
+function finishRound(shift, skipped, seed = null) {
+    let s = shiftStats.get(shift.name);
+    if (!s) {
+        s = { rounds: 0, skipped: 0, lastSeed: null };
+        shiftStats.set(shift.name, s);
+    }
+    s.rounds++;
+    if (skipped) s.skipped++;
+    if (seed != null) s.lastSeed = seed;
+
+    if (s.rounds % STATS_LOG_EVERY === 0) {
+        tslog(`📊 [${tag(shift)}] 完成 ${s.rounds} 轮 | 跳过 ${s.skipped} 轮 | ` +
+            `全局唯一 IP ${usedIPs.size} 个 | 冷却端点 ${proxyCooldown.size} 个 | ` +
+            `最近 seed ${s.lastSeed ?? '-'}`);
+    }
+}
+
+// ==================== 调度 ====================
 
 function formatDay({ year, month, day }) {
     return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-/** 队列为空时生成下一个美国东部日历日的访问时刻（只保留未来时刻） */
-function ensureQueue(state, params, now) {
-    while (state.events.length === 0) {
-        state.day = state.day ? nextDay(state.day) : etDayKey(now);
-        state.events = buildDayEvents(state.day.year, state.day.month, state.day.day, params.visitsPerDay)
-            .filter(t => t > now);
-        tslog(`📅 链接 #${state.index + 1} · ${formatDay(state.day)} 计划 ${state.events.length} 次访问`);
+/** 队列为空时生成下一个本地日历日的访问时刻（只保留未来时刻） */
+function ensureQueue(state, shift, now) {
+    while (state.events.length === 0 && !stopping) {
+        state.day = state.day ? nextDay(state.day) : tzDayKey(now, shift.tz);
+        state.events = buildDayEvents(
+            state.day.year, state.day.month, state.day.day,
+            shift.visitsPerDay, shift.weights, shift.tz,
+        ).filter(t => t > now);
+        tslog(`📅 [${tag(shift)}] 链接 #${state.index + 1} · ${formatDay(state.day)} ` +
+            `计划 ${state.events.length} 次访问`);
     }
 }
 
@@ -536,154 +644,243 @@ async function sleepInterruptible(ms) {
     }
 }
 
-function finishRound(skipped) {
-    stats.rounds++;
-    if (skipped) stats.skipped++;
-    if (stats.rounds % STATS_LOG_EVERY === 0) {
-        tslog(`📊 统计: 完成 ${stats.rounds} 轮 | 跳过 ${stats.skipped} 轮 | ` +
-            `已用唯一 IP ${usedIPs.size} 个 | 冷却端点 ${proxyCooldown.size} 个 | ` +
-            `最近 seed ${stats.lastSeed ?? '-'}`);
-    }
-}
-
-/** 执行一次访问：新浏览器 → 新出口 IP → 本地空页 → 点击目标链接 → 真实停留 */
-async function visitOnce(state, params) {
+/** 执行一次访问：新出口 IP → 本地空页 → 点击目标链接 → 真实停留（浏览器由调用方启动） */
+async function visitWithSlot(state, shift, slot, params) {
     const { entry } = state;
     const linkNo = state.index + 1;
-    const socialUrl = params.socialUrls[Math.floor(Math.random() * params.socialUrls.length)];
+    const t = tag(shift);
+    const socialUrl = shift.socials[Math.floor(Math.random() * shift.socials.length)];
     const socialHost = hostnameOf(socialUrl);
+    let ctx = null;
+    let skipped = false;
 
     try {
-        await ensureProxyList();
-    } catch (e) {
-        tslog(`⚠️  链接 #${linkNo} 获取代理列表失败: ${e.message}，跳过本次访问`);
-        finishRound(true);
-        return;
-    }
+        const picked = await acquireUniqueProxy(slot.browser, shift.region);
+        if (!picked) {
+            tslog(`⏭️ [${t}] 链接 #${linkNo} 跳过本次访问：未获取到未使用过的出口 IP`);
+            skipped = true;
+            return;
+        }
 
-    let slot;
-    try {
-        slot = await takeBrowser();
-    } catch (e) {
-        tslog(`⚠️  链接 #${linkNo} 启动浏览器失败: ${e.message}，跳过本次访问`);
-        finishRound(true);
-        return;
-    }
-    activeSlot = slot;
-    stats.lastSeed = slot.seed;
+        const { key, page, ip } = picked;
+        ctx = picked.ctx;
 
-    const picked = await acquireUniqueProxy(slot.browser);
-    if (!picked) {
-        tslog(`⏭️ 链接 #${linkNo} 跳过本次访问：未获取到未使用过的出口 IP`);
-        activeSlot = null;
-        await closeSlot(slot);
-        finishRound(true);
-        return;
-    }
+        tslog(`🔵 [${t}] 链接 #${linkNo} 开始访问 → ${entry.url}`);
+        tslog(`   社媒入口: ${socialUrl} | 端点 ${key} | 出口 IP ${ip} | seed ${slot.seed}`);
 
-    const { key, ctx, page, ip } = picked;
-    tslog(`🔵 链接 #${linkNo} 开始访问 → ${entry.url}`);
-    tslog(`   社媒入口: ${socialUrl} | 端点 ${key} | 出口 IP ${ip} | seed ${slot.seed}`);
-
-    try {
         const fpInfo = await readFingerprint(page);
 
         page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
         page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
 
-        setupRequestHandler(page, socialHost, targetHosts, entry.url);
+        setupRequestHandler(page, socialHost, shift.targetHosts, entry.url);
 
         await page.goto(socialUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
-        const clicked = await clickTargetLink(page, params);
+        const clicked = await clickTargetLink(page);
 
         if (clicked && !stopping) {
-            tslog(`   ⏳ 目标页停留 ${params.afterClickSec} 秒`);
+            tslog(`   ⏳ [${t}] 目标页停留 ${params.afterClickSec} 秒`);
             await sleep(params.afterClickSec * 1000);
         }
 
-        tslog(`✅ 链接 #${linkNo} 本次访问结束`);
-        console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} social=${socialUrl} ` +
+        tslog(`✅ [${t}] 链接 #${linkNo} 本次访问结束`);
+        console.log(`ROUND_SUMMARY shift=${shift.name} link=${linkNo} url=${entry.url} social=${socialUrl} ` +
             `proxy=${key} ip=${ip} seed=${slot.seed} fp=${fpInfo.fp} gl=${fpInfo.gl} ` +
             `click=${clicked ? 1 : 0}`);
     } catch (e) {
-        tslog(`❌ 链接 #${linkNo} 访问异常: ${e.message}`);
+        tslog(`❌ [${t}] 链接 #${linkNo} 访问异常: ${e.message}`);
     } finally {
-        activeContexts.delete(ctx);
-        await ctx.close().catch(() => {});
-        activeSlot = null;
-        await closeSlot(slot);
-        finishRound(false);
+        if (ctx) {
+            activeContexts.delete(ctx);
+            await ctx.close().catch(() => {});
+        }
+        finishRound(shift, skipped, slot.seed);
     }
 }
 
-/** 每个链接独立排程，每次取最早到期的访问执行 */
-async function scheduleLoop(entries, params) {
-    const states = entries.map((entry, index) => ({ index, entry, events: [], day: null }));
+/**
+ * 每条链接一个独立循环：等到本链接下一个访问时刻，
+ * 在访问前 PREWARM_LEAD_MS 获取并发槽位并启动浏览器，到点执行访问。
+ */
+async function runLinkLoop(link, shift, params) {
+    const state = { index: link.index, entry: { url: link.url }, events: [], day: null };
 
     while (!stopping) {
-        const now = Date.now();
-        for (const s of states) ensureQueue(s, params, now);
+        ensureQueue(state, shift, Date.now());
+        if (stopping) break;
 
-        states.sort((a, b) => a.events[0] - b.events[0]);
-        const next = states[0];
-        const wait = next.events[0] - Date.now();
+        const eventTime = state.events[0];
+        if (eventTime === undefined) continue;
 
-        if (wait > 0) {
-            if (wait > PREWARM_LEAD_MS) {
-                await sleepInterruptible(wait - PREWARM_LEAD_MS);
-                if (stopping) break;
-            }
-            startPrewarm();
-            const remaining = next.events[0] - Date.now();
-            if (remaining > 0) await sleepInterruptible(remaining);
+        const beforeLead = eventTime - PREWARM_LEAD_MS - Date.now();
+        if (beforeLead > 0) {
+            await sleepInterruptible(beforeLead);
+            if (stopping) break;
+        }
+
+        try {
+            await ensureProxyList(shift.region);
+        } catch (e) {
+            tslog(`⚠️ [${tag(shift)}] 链接 #${state.index + 1} 获取代理列表失败: ` +
+                `${e.message}，跳过本次访问`);
+            state.events.shift();
+            finishRound(shift, true);
             continue;
         }
 
-        next.events.shift();
-        await visitOnce(next, params);
+        if (!await acquireSlot()) break;
+
+        let slot = null;
+        let visited = false;
+        try {
+            slot = await launchFreshBrowser(shift);
+            activeSlots.add(slot);
+
+            const remaining = eventTime - Date.now();
+            if (remaining > 0) {
+                await sleepInterruptible(remaining);
+                if (stopping) break;
+            }
+            state.events.shift();
+            visited = true;
+            await visitWithSlot(state, shift, slot, params);
+        } catch (e) {
+            tslog(`❌ [${tag(shift)}] 链接 #${state.index + 1} 本轮异常: ${e.message}`);
+            if (!visited) {
+                if (state.events[0] === eventTime) state.events.shift();
+                finishRound(shift, true);
+            }
+        } finally {
+            if (slot) {
+                activeSlots.delete(slot);
+                await closeSlot(slot);
+            }
+            releaseSlot();
+        }
     }
 }
 
-/** 关闭计划时的直接轮询：按 1→2→…→N 顺序连续访问，无额外等待 */
-async function roundRobinLoop(entries, params) {
-    const states = entries.map((entry, index) => ({ index, entry }));
-    let cursor = 0;
+/** 关闭计划时的连续访问：每条链接一个循环，无额外等待，仍受并发上限约束 */
+async function runLinkRoundRobin(link, shift, params) {
+    const state = { index: link.index, entry: { url: link.url }, events: [], day: null };
 
     while (!stopping) {
-        const state = states[cursor];
-        cursor = (cursor + 1) % states.length;
-        await visitOnce(state, params);
+        try {
+            await ensureProxyList(shift.region);
+        } catch (e) {
+            tslog(`⚠️ [${tag(shift)}] 链接 #${state.index + 1} 获取代理列表失败: ${e.message}`);
+            await sleep(1000);
+            continue;
+        }
+
+        if (!await acquireSlot()) break;
+
+        let slot = null;
+        let visited = false;
+        try {
+            slot = await launchFreshBrowser(shift);
+            activeSlots.add(slot);
+            visited = true;
+            await visitWithSlot(state, shift, slot, params);
+        } catch (e) {
+            tslog(`❌ [${tag(shift)}] 链接 #${state.index + 1} 本轮异常: ${e.message}`);
+            if (!visited) finishRound(shift, true);
+        } finally {
+            if (slot) {
+                activeSlots.delete(slot);
+                await closeSlot(slot);
+            }
+            releaseSlot();
+        }
     }
+}
+
+// ==================== 班次 ====================
+
+function makeShift(name, region, tz, locale, weights, links, socials, visitsPerDay) {
+    return {
+        name, region, tz, locale, weights, socials, visitsPerDay,
+        links: links.map((url, index) => ({ url, index })),
+        targetHosts: [...new Set(links.map(hostnameOf).filter(Boolean))],
+    };
 }
 
 // ==================== 主流程 ====================
 
 async function run() {
     const params = parseArgs();
-    const targets = loadUrlList(params.urlsFile, '目标链接');
-    const socialUrls = loadUrlList(params.socialFile, '社媒入口');
-    const entries = targets.map(url => ({ url }));
-    params.socialUrls = socialUrls;
+    const groups = loadUrlGroups(params.urlsFile);
+    if (groups.us.length === 0) {
+        throw new Error('美国班目标链接为空（visit-links.json 的 us 数组）');
+    }
+
+    const socialsUs = loadUrlList(params.socialFile, '社媒入口(US)');
+    const socialsJp = groups.jp.length > 0
+        ? loadUrlList(params.socialJpFile, '社媒入口(JP)')
+        : [];
+    const socialsKr = groups.kr.length > 0
+        ? loadUrlList(params.socialKrFile, '社媒入口(KR)')
+        : [];
+
     headlessFlag = params.headless;
-    targetHosts = [...new Set(targets.map(hostnameOf).filter(Boolean))];
+    slotPool.limit = params.maxConcurrency;
 
-    console.log('🚀 启动 CloakBrowser (adsterras 社媒点击访问器)...');
-    console.log(`📋 目标链接: ${entries.length} 条 | 文件: ${params.urlsFile}`);
-    console.log(`📋 社媒入口: ${socialUrls.length} 条 | 文件: ${params.socialFile}`);
-    console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
-    console.log(`⏱️  点击延迟: ${CLICK_DELAY_MIN_MS / 1000}-${CLICK_DELAY_MAX_MS / 1000} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: 100%`);
-    console.log('🌍 出口策略: 每轮全新浏览器（独立 seed）+ 隐私上下文 + 出口 IP 去重（重复则跳过本次访问）');
-    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
-    console.log(`📡 代理来源: NovProxy API（启动缓存端点，每 ${PROXY_LIST_REFRESH_MS / 60000} 分钟刷新）`);
-    console.log(`🔥 预热: 访问时刻前 ${PREWARM_LEAD_MS / 1000} 秒启动下一轮浏览器\n`);
+    const shifts = [makeShift(
+        'us', 'US', 'America/New_York', 'en-US',
+        US_HOURLY_WEIGHTS, groups.us, socialsUs, params.visitsPerDayUs,
+    )];
+    if (groups.jp.length === 0) {
+        console.log('⚠️  日本班链接为空（visit-links.json 的 jp 数组），跳过日本班');
+    } else {
+        shifts.push(makeShift(
+            'jp', 'JP', JP_TZ, 'ja-JP',
+            JP_HOURLY_WEIGHTS, groups.jp, socialsJp, params.visitsPerDayJp,
+        ));
+    }
+    if (groups.kr.length === 0) {
+        console.log('⚠️  韩国班链接为空（visit-links.json 的 kr 数组），跳过韩国班');
+    } else {
+        shifts.push(makeShift(
+            'kr', 'KR', KR_TZ, 'ko-KR',
+            KR_HOURLY_WEIGHTS, groups.kr, socialsKr, params.visitsPerDayKr,
+        ));
+    }
 
-    await ensureProxyList(true);
+    console.log(`🚀 启动 CloakBrowser (adsterras ${shifts.length} 班社媒点击访问器)...`);
+    for (const s of shifts) {
+        console.log(`📋 [${tag(s)}] 目标链接 ${s.links.length} 条 | 代理 region=${s.region} | ` +
+            `时区 ${s.tz} | 语言 ${s.locale} | 日均 ${s.visitsPerDay}/链接`);
+    }
+    console.log(`📋 链接文件: ${params.urlsFile}`);
+    console.log(`📋 社媒入口(US): ${socialsUs.length} 条 | 文件: ${params.socialFile}`);
+    if (groups.jp.length > 0) {
+        console.log(`📋 社媒入口(JP): ${socialsJp.length} 条 | 文件: ${params.socialJpFile}`);
+    }
+    if (groups.kr.length > 0) {
+        console.log(`📋 社媒入口(KR): ${socialsKr.length} 条 | 文件: ${params.socialKrFile}`);
+    }
+    console.log(`🔀 访问计划: ${SCHEDULE_ENABLED
+        ? '开启（每条链接按本班本地作息独立排程）'
+        : '关闭（每条链接连续访问，忽略日均计划）'}`);
+    console.log(`⏱️  点击延迟: ${CLICK_DELAY_MIN_MS / 1000}-${CLICK_DELAY_MAX_MS / 1000} 秒 | ` +
+        `点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: 100%`);
+    console.log(`🌍 出口策略: 每轮全新浏览器（独立 seed）+ 隐私上下文 + 出口 IP 去重`);
+    console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'} | 并发上限: ${slotPool.limit} 个浏览器`);
+    console.log(`📡 代理来源: NovProxy API（按区域缓存，每 ${PROXY_LIST_REFRESH_MS / 60000} 分钟刷新）`);
+    console.log(`🔥 预热: 各链接访问时刻前 ${PREWARM_LEAD_MS / 1000} 秒启动浏览器\n`);
+
+    const init = await Promise.allSettled(shifts.map(s => ensureProxyList(s.region, true)));
+    init.forEach((r, i) => {
+        if (r.status === 'rejected') {
+            tslog(`⚠️  [${tag(shifts[i])}] 代理列表初始化失败: ${r.reason?.message || r.reason}`);
+        }
+    });
 
     if (SCHEDULE_ENABLED) {
-        await scheduleLoop(entries, params);
+        await Promise.all(shifts.flatMap(s => s.links.map(link => runLinkLoop(link, s, params))));
     } else {
-        await roundRobinLoop(entries, params);
+        await Promise.all(shifts.flatMap(s => s.links.map(link => runLinkRoundRobin(link, s, params))));
     }
 
     tslog('🏁 已停止，正在收尾...');
@@ -695,12 +892,10 @@ async function cleanup() {
         await c.close().catch(() => {});
     }
     activeContexts.clear();
-    if (activeSlot) {
-        const slot = activeSlot;
-        activeSlot = null;
+    for (const slot of activeSlots) {
         await closeSlot(slot);
     }
-    await closePrewarmed();
+    activeSlots.clear();
 }
 
 process.on('SIGINT', () => {
