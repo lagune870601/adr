@@ -6,13 +6,14 @@
  *     [--visits-per-day=300] [--ad-timeout-sec=60] [--after-click-sec=10]
  *     [--click-rate=1] [--headless]
  *
- * 简化版：保留代理、指纹、排程、点击四项能力，不再对广告请求做域名白名单。
+ * 简化版：保留指纹、排程、点击三项能力，不再对广告请求做域名白名单。
  * 每个广告链接独立排程：日访问量服从泊松分布（默认 300），按美国东部时间的
  * 小时权重分配（凌晨稀少、晚间最高）。每次访问开始时先决定是否点击。
  * 每轮访问使用全新的浏览器进程（随机 --fingerprint seed），保证轮与轮之间
  * 指纹不可关联；轮内新建隐私上下文，并通过 createBrowserContext({ proxyServer })
- * 为该上下文指定代理。访问前先用轻量 IP 接口确认出口 IP：若本次进程已使用过
- * 则更换端点重试；达到尝试上限仍找不到未使用过的出口 IP 时，跳过本次访问。
+ * 指定本地 mitmproxy socks5（socks5://127.0.0.1:18008，加载 botAnti3.py 改写请求头）。
+ * 每轮访问前先发一次引导请求，把 botAnti3.py 的全局伪装 IP 固定为 73.89.34.60。
+ * 浏览器带 --ignore-certificate-errors 以信任 mitmproxy 的 TLS 拦截证书。
  * 下一轮浏览器在访问时刻前预热，启动开销落在轮间空档里。
  */
 
@@ -20,7 +21,6 @@ import { launch } from 'cloakbrowser/puppeteer';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { fetchNovProxyList } from './shared/proxy-utils.js';
 import { etParts, etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,23 +42,12 @@ const VISITS_PER_DAY = 300;
 const NON_CLICK_DWELL_MS = 20000;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 
-// ==================== 代理与出口 IP ====================
+// ==================== 代理 ====================
 
-const PROXY_API_URL = 'https://white.novproxy.com/white/api?region=US&num=1000&time=1&format=1&type=txt';
-const PROXY_LIST_REFRESH_MS = 30 * 60 * 1000;
-// 端点碰撞后冷却：等它的出口 IP 轮换（time=1 约 1 分钟）
-const PROXY_COOLDOWN_MS = 60 * 1000;
-// 探测失败后的冷却，比碰撞短
-const PROBE_ERROR_COOLDOWN_MS = 15 * 1000;
-const PROBE_TIMEOUT_MS = 8000;
-const PROBE_CONCURRENCY = 3;
-const MAX_PROXY_ATTEMPTS = 6;
-const IP_PROBE_URLS = [
-    'https://icanhazip.com/',
-    'https://checkip.amazonaws.com/',
-    'https://api.ipify.org/',
-];
-const IPV4_RE = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+const LOCAL_PROXY = 'socks5://127.0.0.1:18008';
+// 每轮引导请求：触发 botAnti3.py 把后续请求的伪装 IP 固定为该地址
+const BOOTSTRAP_IP = '73.89.34.60';
+const BOOTSTRAP_URL = `http://httpbin.org/replaceproxy.html?ip=${BOOTSTRAP_IP}`;
 const STATS_LOG_EVERY = 20;
 // 下一轮浏览器在访问时刻前多少毫秒启动（启动实测约 2 秒）
 const PREWARM_LEAD_MS = 15000;
@@ -294,6 +283,7 @@ const BASE_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
+    '--ignore-certificate-errors',
 ];
 
 let headlessFlag = isLinux;
@@ -304,15 +294,7 @@ let prewarmedSlot = null;
 let prewarmPromise = null;
 let activeSlot = null;
 
-let proxyEndpoints = [];
-let proxyListFetchedAt = 0;
-const usedIPs = new Set();
-const proxyCooldown = new Map();
 const stats = { rounds: 0, skipped: 0, lastSeed: null };
-
-function endpointKey(ep) {
-    return `${ep.host}:${ep.port}`;
-}
 
 /**
  * 启动一个全新的浏览器进程。每次启动随机生成指纹 seed，
@@ -376,66 +358,27 @@ async function closePrewarmed() {
     if (slot) await closeSlot(slot);
 }
 
-async function createProxyContext(browser, proxyKey) {
+async function createProxyContext(browser) {
     if (typeof browser.createBrowserContext !== 'function') {
         throw new Error('当前浏览器不支持 createBrowserContext');
     }
-    return browser.createBrowserContext({ proxyServer: `socks5://${proxyKey}` });
+    return browser.createBrowserContext({ proxyServer: LOCAL_PROXY });
 }
 
-// ==================== 代理列表 ====================
-
-async function ensureProxyList(force = false) {
-    if (!force && proxyEndpoints.length > 0 &&
-        Date.now() - proxyListFetchedAt < PROXY_LIST_REFRESH_MS) {
-        return;
-    }
+/**
+ * 用临时页发一次引导请求，让 botAnti3.py 把全局伪装 IP 设为 BOOTSTRAP_IP。
+ * 用独立页面而不是主页面，避免给广告页带上 httpbin.org 的 Referer。
+ */
+async function sendBootstrapRequest(ctx) {
+    const page = await ctx.newPage();
     try {
-        const list = await fetchNovProxyList(PROXY_API_URL);
-        proxyEndpoints = list;
-        proxyListFetchedAt = Date.now();
-        tslog(`📡 代理列表已缓存: ${list.length} 个端点`);
-    } catch (e) {
-        if (proxyEndpoints.length === 0) throw e;
-        tslog(`⚠️  代理列表刷新失败，继续使用旧列表: ${e.message}`);
+        await page.goto(BOOTSTRAP_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    } finally {
+        await page.close().catch(() => {});
     }
 }
 
-function pickCandidateEndpoints(count, tried) {
-    const now = Date.now();
-    const pool = proxyEndpoints.filter(ep => {
-        const key = endpointKey(ep);
-        if (tried.has(key)) return false;
-        const until = proxyCooldown.get(key);
-        if (until && until > now) return false;
-        if (until) proxyCooldown.delete(key);
-        return true;
-    });
-
-    const picked = [];
-    while (picked.length < count && pool.length > 0) {
-        const idx = Math.floor(Math.random() * pool.length);
-        picked.push(pool[idx]);
-        pool.splice(idx, 1);
-    }
-    return picked;
-}
-
-// ==================== 出口 IP 探测 ====================
-
-async function probeEgressIP(page) {
-    for (const url of IP_PROBE_URLS) {
-        try {
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PROBE_TIMEOUT_MS });
-            const text = await page.evaluate(() => (document.body ? document.body.innerText : ''));
-            const ip = text.trim().split(/\s+/)[0] || '';
-            if (IPV4_RE.test(ip)) return ip;
-        } catch {
-            // 尝试下一个探测接口
-        }
-    }
-    return null;
-}
+// ==================== 指纹 ====================
 
 /** 读取本轮的 canvas 指纹哈希和 WebGL 可用性，仅用于日志验证 */
 async function readFingerprint(page) {
@@ -462,89 +405,6 @@ async function readFingerprint(page) {
     } catch {
         return { fp: null, gl: null };
     }
-}
-
-async function probeCandidate(browser, ep) {
-    const key = endpointKey(ep);
-    let ctx = null;
-    try {
-        ctx = await createProxyContext(browser, key);
-        activeContexts.add(ctx);
-
-        const page = await ctx.newPage();
-        await page.setCacheEnabled(false).catch(() => {});
-
-        const ip = await probeEgressIP(page);
-        return { key, ctx, page, ip };
-    } catch (e) {
-        if (ctx) {
-            activeContexts.delete(ctx);
-            await ctx.close().catch(() => {});
-        }
-        return { key, ctx: null, page: null, ip: null, error: e.message };
-    }
-}
-
-async function closeCandidate(c) {
-    if (c && c.ctx) {
-        activeContexts.delete(c.ctx);
-        await c.ctx.close().catch(() => {});
-    }
-}
-
-/**
- * 在尝试上限内找到一个出口 IP 未被本进程使用过的上下文。
- * 并行的候选会保留第一个命中者，其余关闭；碰撞端点冷却后重试。
- * 找不到则返回 null（调用方跳过本轮）。
- */
-async function acquireUniqueProxy(browser) {
-    const tried = new Set();
-    let attempts = 0;
-
-    while (attempts < MAX_PROXY_ATTEMPTS && !stopping) {
-        const batch = pickCandidateEndpoints(
-            Math.min(PROBE_CONCURRENCY, MAX_PROXY_ATTEMPTS - attempts), tried);
-        if (batch.length === 0) return null;
-
-        attempts += batch.length;
-        for (const ep of batch) tried.add(endpointKey(ep));
-
-        const results = await Promise.all(batch.map(ep => probeCandidate(browser, ep)));
-
-        if (stopping) {
-            await Promise.all(results.map(closeCandidate));
-            return null;
-        }
-
-        let winner = null;
-        for (const r of results) {
-            if (!r) continue;
-            if (!r.ip) {
-                proxyCooldown.set(r.key, Date.now() + PROBE_ERROR_COOLDOWN_MS);
-                await closeCandidate(r);
-                continue;
-            }
-            if (usedIPs.has(r.ip)) {
-                proxyCooldown.set(r.key, Date.now() + PROXY_COOLDOWN_MS);
-                await closeCandidate(r);
-                continue;
-            }
-            if (!winner) {
-                winner = r;
-                usedIPs.add(r.ip);
-            } else {
-                await closeCandidate(r);
-            }
-        }
-
-        if (winner) {
-            tslog(`   🌍 出口 IP: ${winner.ip} | 端点 ${winner.key}`);
-            return winner;
-        }
-        tslog(`   🔁 本批 ${batch.length} 个端点均不可用或出口 IP 重复，继续尝试`);
-    }
-
-    return null;
 }
 
 // ==================== 调度循环 ====================
@@ -595,7 +455,6 @@ function finishRound(skipped) {
     if (skipped) stats.skipped++;
     if (stats.rounds % STATS_LOG_EVERY === 0) {
         tslog(`📊 统计: 完成 ${stats.rounds} 轮 | 跳过 ${stats.skipped} 轮 | ` +
-            `已用唯一 IP ${usedIPs.size} 个 | 冷却端点 ${proxyCooldown.size} 个 | ` +
             `最近 seed ${stats.lastSeed ?? '-'}`);
     }
 }
@@ -604,14 +463,6 @@ function finishRound(skipped) {
 async function visitOnce(state, params, click, icon = '🔵') {
     const { entry } = state;
     const linkNo = state.index + 1;
-
-    try {
-        await ensureProxyList();
-    } catch (e) {
-        tslog(`⚠️  链接 #${linkNo} 获取代理列表失败: ${e.message}，跳过本次访问`);
-        finishRound(true);
-        return;
-    }
 
     let slot;
     try {
@@ -624,20 +475,34 @@ async function visitOnce(state, params, click, icon = '🔵') {
     activeSlot = slot;
     stats.lastSeed = slot.seed;
 
-    const picked = await acquireUniqueProxy(slot.browser);
-    if (!picked) {
-        tslog(`⏭️ 链接 #${linkNo} 跳过本次访问：未获取到未使用过的出口 IP`);
-        activeSlot = null;
-        await closeSlot(slot);
-        finishRound(true);
-        return;
-    }
-
-    const { key, ctx, page, ip } = picked;
-    tslog(`${icon} 链接 #${linkNo} 开始访问 → ${entry.url}`);
-    tslog(`   端点 ${key} | 出口 IP ${ip} | seed ${slot.seed}`);
-
+    let ctx;
+    let skipped = false;
     try {
+        ctx = await createProxyContext(slot.browser);
+        activeContexts.add(ctx);
+
+        const page = await ctx.newPage();
+        await page.setCacheEnabled(false).catch(() => {});
+
+        tslog(`${icon} 链接 #${linkNo} 开始访问 → ${entry.url}`);
+        tslog(`   本地代理 ${LOCAL_PROXY} | seed ${slot.seed}`);
+
+        let bootstrapOk = false;
+        for (let attempt = 1; attempt <= 2 && !bootstrapOk; attempt++) {
+            try {
+                await sendBootstrapRequest(ctx);
+                bootstrapOk = true;
+            } catch (e) {
+                tslog(`   ⚠️ 引导请求失败（第 ${attempt} 次）: ${e.message}`);
+            }
+        }
+        if (!bootstrapOk) {
+            tslog(`⏭️ 链接 #${linkNo} 跳过本次访问：伪装 IP 引导失败`);
+            skipped = true;
+            return;
+        }
+        tslog(`   🎭 伪装 IP 已设为 ${BOOTSTRAP_IP}`);
+
         const fpInfo = await readFingerprint(page);
 
         page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
@@ -656,16 +521,18 @@ async function visitOnce(state, params, click, icon = '🔵') {
 
         tslog(`✅ 链接 #${linkNo} 本次访问结束`);
         console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} ` +
-            `proxy=${key} ip=${ip} seed=${slot.seed} fp=${fpInfo.fp} gl=${fpInfo.gl} ` +
+            `proxy=${LOCAL_PROXY} seed=${slot.seed} fp=${fpInfo.fp} gl=${fpInfo.gl} ` +
             `click=${click ? 1 : 0}`);
     } catch (e) {
         tslog(`❌ 链接 #${linkNo} 访问异常: ${e.message}`);
     } finally {
-        activeContexts.delete(ctx);
-        await ctx.close().catch(() => {});
+        if (ctx) {
+            activeContexts.delete(ctx);
+            await ctx.close().catch(() => {});
+        }
         activeSlot = null;
         await closeSlot(slot);
-        finishRound(false);
+        finishRound(skipped);
     }
 }
 
@@ -729,12 +596,10 @@ async function run() {
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
     console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
     console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MS / 1000} 秒`);
-    console.log('🌍 出口策略: 每轮全新浏览器（独立 seed）+ 隐私上下文 + 出口 IP 去重（重复则跳过本次访问）');
+    console.log('🌍 出口策略: 每轮全新浏览器（独立 seed）+ 隐私上下文 + 固定本地 mitmproxy socks5');
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
-    console.log(`📡 代理来源: NovProxy API（启动缓存端点，每 ${PROXY_LIST_REFRESH_MS / 60000} 分钟刷新）`);
+    console.log(`📡 本地代理: ${LOCAL_PROXY}（mitmproxy + botAnti3.py）`);
     console.log(`🔥 预热: 访问时刻前 ${PREWARM_LEAD_MS / 1000} 秒启动下一轮浏览器\n`);
-
-    await ensureProxyList(true);
 
     if (SCHEDULE_ENABLED) {
         await scheduleLoop(entries, params);
