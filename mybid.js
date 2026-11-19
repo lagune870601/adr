@@ -36,9 +36,9 @@ const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
 // 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
-const SCHEDULE_ENABLED = false;
+const SCHEDULE_ENABLED = true;
 // 每次访问开始即决定是否点击：默认 100% 等待广告并点击，调低后其余访问仅停留 20 秒后关闭
-const CLICK_PROBABILITY = 1;
+const CLICK_PROBABILITY = 0.01;
 const VISITS_PER_DAY = 300;
 const NON_CLICK_DWELL_MS = 20000;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
