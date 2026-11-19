@@ -1,0 +1,31 @@
+# ============================================================
+# mybid 访问器 Docker Image
+# 基础镜像: cloakhq/cloakbrowser (含 CloakBrowser/Chromium + Xvfb)
+# 入口: entrypoint.sh —— 启动 mitmdump(botAnti3.py) + mybid.js
+# ============================================================
+
+FROM cloakhq/cloakbrowser:latest
+
+LABEL description="mybid mBidadm visitor with local mitmproxy"
+LABEL maintainer="dev"
+
+ENV NODE_ENV=production
+
+WORKDIR /app
+
+# 依赖（利用 Docker 缓存层）
+COPY package.json package-lock.json ./
+RUN npm install --omit=dev
+
+# botAnti3.py 依赖 mitmproxy 与 requests；基础镜像自带 Python 3.12
+RUN pip3 install --no-cache-dir --upgrade pip \
+ && pip3 install --no-cache-dir mitmproxy requests
+
+COPY botAnti3.py entrypoint.sh mybid.js mybid-urls.json ./
+COPY shared/ ./shared/
+RUN chmod +x entrypoint.sh && mkdir -p logs
+
+EXPOSE 18008
+STOPSIGNAL SIGTERM
+
+CMD ["/app/entrypoint.sh"]

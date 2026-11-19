@@ -6,3 +6,5 @@ node_modules/
 *.md
 memory/
 .claude/
+ip-allocator/node_modules/
+logs/

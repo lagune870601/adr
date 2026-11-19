@@ -1,0 +1,14 @@
+{
+  "name": "mybid-ip-allocator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reserve unique US residential IPs from ad.ip_cz88 for mybid containers",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "mysql2": "^3.22.5"
+  }
+}

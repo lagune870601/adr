@@ -11,8 +11,9 @@
  * 小时权重分配（凌晨稀少、晚间最高）。每次访问开始时先决定是否点击。
  * 每轮访问使用全新的浏览器进程（随机 --fingerprint seed），保证轮与轮之间
  * 指纹不可关联；轮内新建隐私上下文，并通过 createBrowserContext({ proxyServer })
- * 指定本地 mitmproxy socks5（socks5://127.0.0.1:18008，加载 botAnti3.py 改写请求头）。
- * 每轮访问前先发一次引导请求，把 botAnti3.py 的全局伪装 IP 固定为 73.89.34.60。
+ * 指定本地 mitmproxy socks5（默认 socks5://127.0.0.1:18008，可用 SOCKS_PROXY 覆盖，
+ * 加载 botAnti3.py 改写请求头）。每次访问前向 IP 分配服务（ALLOCATOR_URL）领取一个
+ * 唯一 IP，再发引导请求把 botAnti3.py 的全局伪装 IP 固定为该地址。
  * 浏览器带 --ignore-certificate-errors 以信任 mitmproxy 的 TLS 拦截证书。
  * 下一轮浏览器在访问时刻前预热，启动开销落在轮间空档里。
  */
@@ -25,7 +26,7 @@ import { etParts, etDayKey, nextDay, buildDayEvents } from './shared/visit-sched
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-const isLinux = false;
+const DEFAULT_HEADLESS = process.env.HEADLESS === '1';
 
 const NAV_TIMEOUT_MS = 60000;
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -42,12 +43,17 @@ const VISITS_PER_DAY = 300;
 const NON_CLICK_DWELL_MS = 20000;
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 
-// ==================== 代理 ====================
+// ==================== 代理与 IP 分配 ====================
 
-const LOCAL_PROXY = 'socks5://127.0.0.1:18008';
-// 每轮引导请求：触发 botAnti3.py 把后续请求的伪装 IP 固定为该地址
-const BOOTSTRAP_IP = '73.89.34.60';
-const BOOTSTRAP_URL = `http://httpbin.org/replaceproxy.html?ip=${BOOTSTRAP_IP}`;
+const LOCAL_PROXY = process.env.SOCKS_PROXY || 'socks5://127.0.0.1:18008';
+const ALLOCATOR_URL = (process.env.ALLOCATOR_URL || 'http://127.0.0.1:18010').replace(/\/+$/, '');
+const ALLOCATOR_TOKEN = process.env.ALLOCATOR_TOKEN || '';
+const ALLOCATOR_TIMEOUT_MS = 5000;
+const ALLOCATOR_RETRIES = 2;
+// 引导请求：把伪装 IP 作为 URL 参数，让 botAnti3.py 写入全局 self.ip。
+// 容器内默认指向本地 dummy 服务（bootstrap.mitm.local 在 /etc/hosts 指向 127.0.0.1），
+// 避免依赖外部 httpbin.org；本地开发可覆盖为 http://httpbin.org。
+const BOOTSTRAP_BASE = (process.env.BOOTSTRAP_BASE || 'http://httpbin.org').replace(/\/+$/, '');
 const STATS_LOG_EVERY = 20;
 // 下一轮浏览器在访问时刻前多少毫秒启动（启动实测约 2 秒）
 const PREWARM_LEAD_MS = 15000;
@@ -75,7 +81,7 @@ function parseArgs() {
         afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
         clickProbability: Number.isFinite(envClickRate) && envClickRate >= 0 && envClickRate <= 1 ? envClickRate : CLICK_PROBABILITY,
         visitsPerDay: Number.isInteger(envVisits) && envVisits > 0 ? envVisits : VISITS_PER_DAY,
-        headless: isLinux,
+        headless: DEFAULT_HEADLESS,
     };
 
     for (const arg of args) {
@@ -286,7 +292,7 @@ const BASE_ARGS = [
     '--ignore-certificate-errors',
 ];
 
-let headlessFlag = isLinux;
+let headlessFlag = DEFAULT_HEADLESS;
 const activeContexts = new Set();
 let stopping = false;
 
@@ -366,13 +372,51 @@ async function createProxyContext(browser) {
 }
 
 /**
- * 用临时页发一次引导请求，让 botAnti3.py 把全局伪装 IP 设为 BOOTSTRAP_IP。
+ * 向分配服务领取一个已预留（15 天内不会再次下发）的 IP。
+ * 403/503 这类明确失败不重试；网络错误和超时最多重试 ALLOCATOR_RETRIES 次。
+ */
+async function allocateIp() {
+    let lastErr;
+    for (let attempt = 0; attempt <= ALLOCATOR_RETRIES; attempt++) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), ALLOCATOR_TIMEOUT_MS);
+        try {
+            const headers = {};
+            if (ALLOCATOR_TOKEN) headers['x-allocator-token'] = ALLOCATOR_TOKEN;
+            const res = await fetch(`${ALLOCATOR_URL}/allocate`, { method: 'POST', headers, signal: ac.signal });
+            if (res.status === 503) {
+                const body = await res.json().catch(() => ({}));
+                const err = new Error(body.error || 'no_available_ip');
+                err.fatal = true;
+                throw err;
+            }
+            if (!res.ok) {
+                throw new Error(`分配服务 HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            if (!data || typeof data.ip !== 'string' || !data.ip) {
+                throw new Error('分配服务返回格式异常');
+            }
+            return data;
+        } catch (e) {
+            lastErr = e;
+            if (e.fatal) break;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+    throw lastErr || new Error('分配 IP 失败');
+}
+
+/**
+ * 用临时页发一次引导请求，让 botAnti3.py 把全局伪装 IP 设为分配的地址。
  * 用独立页面而不是主页面，避免给广告页带上 httpbin.org 的 Referer。
  */
-async function sendBootstrapRequest(ctx) {
+async function sendBootstrapRequest(ctx, ip) {
+    const url = `${BOOTSTRAP_BASE}/replaceproxy.html?ip=${encodeURIComponent(ip)}`;
     const page = await ctx.newPage();
     try {
-        await page.goto(BOOTSTRAP_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
     } finally {
         await page.close().catch(() => {});
     }
@@ -464,6 +508,15 @@ async function visitOnce(state, params, click, icon = '🔵') {
     const { entry } = state;
     const linkNo = state.index + 1;
 
+    let allocation;
+    try {
+        allocation = await allocateIp();
+    } catch (e) {
+        tslog(`⏭️ 链接 #${linkNo} 跳过本次访问：IP 分配失败（${e.message}）`);
+        finishRound(true);
+        return;
+    }
+
     let slot;
     try {
         slot = await takeBrowser();
@@ -485,12 +538,12 @@ async function visitOnce(state, params, click, icon = '🔵') {
         await page.setCacheEnabled(false).catch(() => {});
 
         tslog(`${icon} 链接 #${linkNo} 开始访问 → ${entry.url}`);
-        tslog(`   本地代理 ${LOCAL_PROXY} | seed ${slot.seed}`);
+        tslog(`   本地代理 ${LOCAL_PROXY} | seed ${slot.seed} | 分配 IP ${allocation.ip} (id=${allocation.id})`);
 
         let bootstrapOk = false;
         for (let attempt = 1; attempt <= 2 && !bootstrapOk; attempt++) {
             try {
-                await sendBootstrapRequest(ctx);
+                await sendBootstrapRequest(ctx, allocation.ip);
                 bootstrapOk = true;
             } catch (e) {
                 tslog(`   ⚠️ 引导请求失败（第 ${attempt} 次）: ${e.message}`);
@@ -501,7 +554,7 @@ async function visitOnce(state, params, click, icon = '🔵') {
             skipped = true;
             return;
         }
-        tslog(`   🎭 伪装 IP 已设为 ${BOOTSTRAP_IP}`);
+        tslog(`   🎭 伪装 IP 已设为 ${allocation.ip}`);
 
         const fpInfo = await readFingerprint(page);
 
@@ -521,7 +574,8 @@ async function visitOnce(state, params, click, icon = '🔵') {
 
         tslog(`✅ 链接 #${linkNo} 本次访问结束`);
         console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} ` +
-            `proxy=${LOCAL_PROXY} seed=${slot.seed} fp=${fpInfo.fp} gl=${fpInfo.gl} ` +
+            `proxy=${LOCAL_PROXY} ip=${allocation.ip} ip_id=${allocation.id} ` +
+            `seed=${slot.seed} fp=${fpInfo.fp} gl=${fpInfo.gl} ` +
             `click=${click ? 1 : 0}`);
     } catch (e) {
         tslog(`❌ 链接 #${linkNo} 访问异常: ${e.message}`);
@@ -596,9 +650,10 @@ async function run() {
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
     console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
     console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MS / 1000} 秒`);
-    console.log('🌍 出口策略: 每轮全新浏览器（独立 seed）+ 隐私上下文 + 固定本地 mitmproxy socks5');
+    console.log('🌍 出口策略: 每次访问从分配服务领取新 IP + 全新浏览器（独立 seed）+ 隐私上下文 + 本地 mitmproxy socks5');
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
     console.log(`📡 本地代理: ${LOCAL_PROXY}（mitmproxy + botAnti3.py）`);
+    console.log(`🎯 IP 分配服务: ${ALLOCATOR_URL}`);
     console.log(`🔥 预热: 访问时刻前 ${PREWARM_LEAD_MS / 1000} 秒启动下一轮浏览器\n`);
 
     if (SCHEDULE_ENABLED) {
