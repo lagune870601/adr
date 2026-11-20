@@ -219,7 +219,7 @@ async function main() {
     // ─── 2. 创建新环境（带固定代理） ───
     // TODO: 临时使用固定环境 106 测试，测试完恢复 createProfile
     console.log('\n🔧 使用固定环境 106...');
-    const userId = 'k1j2cupc'; // 临时：serial_number=105
+    const userId = 'k1j6mm6r'; // 临时：serial_number=105
     console.log(`🎯 使用环境: user_id=${userId}`);
 
     // 构造代理对象（供 signupCrawler 的 page.authenticate 使用）
