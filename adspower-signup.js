@@ -206,7 +206,7 @@ async function waitForBrowser(wsEndpoint, maxWaitMs = 30000) {
 // ==================== 省流（节省代理流量） ====================
 
 // 直接按资源类型拦截
-const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font', 'stylesheet']);
+const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
 
 // 第三方统计/分析域名（按域名后缀匹配）
 const TRACKER_HOST_PATTERNS = [
