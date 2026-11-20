@@ -63,35 +63,58 @@ export async function getTask(taskTypes) {
 }
 
 /**
+ * 数据库偶发断连（如 "Connection lost"）时重试，避免调度循环因一次抖动中断
+ */
+async function withDbRetry(fn, attempts = 3) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+        try {
+            return await fn();
+        } catch (e) {
+            lastErr = e;
+            if (i < attempts - 1) {
+                console.warn(`   ⚠️  数据库操作失败，1s 后重试 (${i + 1}/${attempts}): ${e.message}`);
+                await new Promise(r => setTimeout(r, 1000));
+            }
+        }
+    }
+    throw lastErr;
+}
+
+/**
  * 更新 crawler_task 状态
  */
 export async function updateTaskStatus(taskId, status) {
-    const connection = await mysql.createConnection(DB_CONFIG);
-    try {
-        await connection.execute(
-            'UPDATE crawler_task SET task_status = ? WHERE id = ?',
-            [status, taskId]
-        );
-        console.log(`   💾 任务状态已更新: id=${taskId}, status=${status}`);
-    } finally {
-        await connection.end();
-    }
+    await withDbRetry(async () => {
+        const connection = await mysql.createConnection(DB_CONFIG);
+        try {
+            await connection.execute(
+                'UPDATE crawler_task SET task_status = ? WHERE id = ?',
+                [status, taskId]
+            );
+            console.log(`   💾 任务状态已更新: id=${taskId}, status=${status}`);
+        } finally {
+            await connection.end().catch(() => {});
+        }
+    });
 }
 
 /**
  * 递增 crawler_task 的 retry_count
  */
 export async function incrementRetryCount(taskId) {
-    const connection = await mysql.createConnection(DB_CONFIG);
-    try {
-        await connection.execute(
-            'UPDATE crawler_task SET retry_count = retry_count + 1, last_retry_time = NOW() WHERE id = ?',
-            [taskId]
-        );
-        console.log(`   💾 retry_count +1 (task id=${taskId})`);
-    } finally {
-        await connection.end();
-    }
+    await withDbRetry(async () => {
+        const connection = await mysql.createConnection(DB_CONFIG);
+        try {
+            await connection.execute(
+                'UPDATE crawler_task SET retry_count = retry_count + 1, last_retry_time = NOW() WHERE id = ?',
+                [taskId]
+            );
+            console.log(`   💾 retry_count +1 (task id=${taskId})`);
+        } finally {
+            await connection.end().catch(() => {});
+        }
+    });
 }
 
 // ==================== adsterra_account 账号查询（供非 REGISTER 任务使用） ====================

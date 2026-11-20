@@ -20,12 +20,21 @@ import { getTask, updateTaskStatus, incrementRetryCount } from './shared/db.js';
 
 const ADSPOWER_API = 'http://127.0.0.1:50325';
 const ADSPOWER_API_KEY = 'eff07fd8e7e01eaadfd547a394b70fe8008fbf3dd5166600';
-const userId = 'k1j9jsy9'; // 临时：serial_number=105
+const ADSPOWER_PROFILE_ID = 'k1j9jsy9'; // 固定环境，常驻复用
 
 // 固定代理配置（SOCKS5）
 const FIXED_PROXY_HOST = '104.233.202.50';
 const FIXED_PROXY_PORT = 17893;
 const FIXED_PROXY_TYPE = 'socks5';
+const FIXED_PROXY_USER = 'chenchao';
+const FIXED_PROXY_PASSWORD = 'chenchao';
+
+// 循环与重连配置
+const TASK_INTERVAL_BASE_MS = 10 * 60 * 1000;   // 任务间隔基数 10 分钟
+const TASK_INTERVAL_JITTER_MS = 5 * 60 * 1000;  // 随机抖动 0~5 分钟
+const POLL_INTERVAL = 10000;                    // 无任务时轮询间隔
+const RECONNECT_MAX_FAILURES = 5;               // 连续重连失败次数上限
+const RECONNECT_BASE_DELAY_MS = 10000;          // 重连指数退避基数
 
 // ==================== 工具函数 ====================
 
@@ -122,8 +131,8 @@ async function createProfile(name, proxyConfig = {}) {
             proxy_type: proxyConfig.type || 'socks5',
             proxy_host: proxyConfig.host || FIXED_PROXY_HOST,
             proxy_port: String(proxyConfig.port || FIXED_PROXY_PORT),
-            proxy_user: proxyConfig.username || '',
-            proxy_password: proxyConfig.password || '',
+            proxy_user: proxyConfig.username || FIXED_PROXY_USER,
+            proxy_password: proxyConfig.password || FIXED_PROXY_PASSWORD,
         },
         fingerprint_config: {
             random_ua: {
@@ -203,6 +212,144 @@ async function waitForBrowser(wsEndpoint, maxWaitMs = 30000) {
     throw new Error('浏览器启动超时');
 }
 
+// ==================== 浏览器连接（常驻复用） ====================
+
+let browser = null;
+let reconnectFailures = 0;
+
+/**
+ * 解析 AdsPower 环境的 WebSocket 地址：
+ * 已打开则复用（browser/active），否则启动（browser/start）
+ */
+async function resolveAdsPowerWs() {
+    try {
+        const active = await adsPowerApi('/api/v1/browser/active', { user_id: ADSPOWER_PROFILE_ID });
+        const ws = active.data?.ws?.puppeteer;
+        if (active.data?.status === 'Active' && ws) {
+            console.log(`   ♻️ 复用已打开的环境: ${ADSPOWER_PROFILE_ID}`);
+            return ws;
+        }
+    } catch (e) {
+        console.log(`   ℹ️ 查询活动状态失败，尝试启动: ${e.message}`);
+    }
+
+    const started = await adsPowerApi('/api/v1/browser/start', { user_id: ADSPOWER_PROFILE_ID });
+    const ws = started.data?.ws?.puppeteer;
+    if (!ws) throw new Error('AdsPower 未返回 Puppeteer WebSocket 地址');
+    console.log(`   ▶️ 已启动环境: ${ADSPOWER_PROFILE_ID}`);
+    return ws;
+}
+
+async function connectOnce(forceRestart = false) {
+    let wsEndpoint;
+    if (forceRestart) {
+        wsEndpoint = await restartProfile();
+    } else {
+        wsEndpoint = await resolveAdsPowerWs();
+    }
+    await waitForBrowser(wsEndpoint);
+
+    const b = await puppeteer.connect({
+        browserWSEndpoint: wsEndpoint,
+        defaultViewport: null,
+        protocolTimeout: 180000,
+    });
+
+    b.on('disconnected', () => {
+        if (browser === b) {
+            browser = null;
+            console.warn('⚠️ AdsPower 浏览器连接已断开');
+        }
+    });
+
+    await setupBandwidthSaving(b);
+    return b;
+}
+
+/**
+ * 停掉再启动 AdsPower 环境。已打开的会话可能残留失效的代理凭据，
+ * 表现为 ws 连得上但所有导航都是 ERR_SOCKS_CONNECTION_FAILED
+ */
+async function restartProfile() {
+    console.log('   🔄 重启 AdsPower 环境（清理失效的代理会话）...');
+    try {
+        await adsPowerApi('/api/v1/browser/stop', { user_id: ADSPOWER_PROFILE_ID });
+    } catch (e) {
+        console.log(`   ℹ️ 停止环境: ${e.message}`);
+    }
+    await sleep(3000);
+    const started = await adsPowerApi('/api/v1/browser/start', { user_id: ADSPOWER_PROFILE_ID });
+    const ws = started.data?.ws?.puppeteer;
+    if (!ws) throw new Error('重启 AdsPower 环境后未返回 WebSocket 地址');
+    console.log('   ✅ AdsPower 环境已重启');
+    return ws;
+}
+
+/**
+ * 用极小请求确认浏览器出口网络可用（代理失效时 ws 仍可连接）
+ */
+async function checkBrowserNetwork(b) {
+    let page;
+    try {
+        page = await b.newPage();
+        const res = await page.goto('https://www.gstatic.com/generate_204', {
+            waitUntil: 'load',
+            timeout: 15000,
+        });
+        return !!res && (res.status() === 204 || res.status() === 200);
+    } catch (e) {
+        console.warn(`   ⚠️ 网络自检失败: ${e.message}`);
+        return false;
+    } finally {
+        await page?.close().catch(() => {});
+    }
+}
+
+/**
+ * 确保浏览器处于已连接状态；断线时按指数退避重连，
+ * 连续失败 RECONNECT_MAX_FAILURES 次后抛出致命错误
+ */
+async function ensureBrowser() {
+    if (browser && browser.isConnected()) {
+        if (await checkBrowserNetwork(browser)) return browser;
+        console.warn('⚠️ 浏览器已连接但出口网络不通，强制重启环境');
+        try {
+            browser.disconnect();
+        } catch {
+            // 已断开
+        }
+        browser = null;
+        // 至少走到“强制重启环境”的分支
+        reconnectFailures = Math.max(reconnectFailures, 2);
+    }
+
+    while (true) {
+        try {
+            const forceRestart = reconnectFailures >= 2;
+            console.log(`\n🔗 连接 AdsPower 浏览器...${forceRestart ? '（强制重启环境）' : ''}`);
+            browser = await connectOnce(forceRestart);
+            if (!(await checkBrowserNetwork(browser))) {
+                throw new Error('网络自检失败（代理不可用）');
+            }
+            reconnectFailures = 0;
+            console.log('✅ Puppeteer 已连接');
+            return browser;
+        } catch (e) {
+            reconnectFailures++;
+            console.error(`💥 连接失败（连续 ${reconnectFailures}/${RECONNECT_MAX_FAILURES}）: ${e.message}`);
+            if (reconnectFailures >= RECONNECT_MAX_FAILURES) {
+                const fatal = new Error(`连续 ${RECONNECT_MAX_FAILURES} 次连接 AdsPower 失败，退出进程`);
+                // 用独立标记，避免与 mysql2 连接错误的 err.fatal 冲突
+                fatal.adspowerFatal = true;
+                throw fatal;
+            }
+            const delay = RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectFailures - 1);
+            console.log(`⏳ ${Math.round(delay / 1000)}s 后重连...`);
+            await sleep(delay);
+        }
+    }
+}
+
 // ==================== 省流（节省代理流量） ====================
 
 // 直接按资源类型拦截
@@ -274,6 +421,16 @@ async function setupBandwidthSaving(browser) {
                     return req.continue();
                 }
 
+                // Cloudflare 挑战资源一律放行，避免影响 Turnstile 校验
+                try {
+                    const host = new URL(url).hostname.toLowerCase();
+                    if (host === 'cloudflare.com' || host.endsWith('.cloudflare.com')) {
+                        return req.continue();
+                    }
+                } catch {
+                    // URL 解析失败则走后续规则
+                }
+
                 const trackerHost = matchedTrackerHost(url);
                 if (trackerHost) {
                     bandwidthStats.byTracker[trackerHost] = (bandwidthStats.byTracker[trackerHost] || 0) + 1;
@@ -308,7 +465,7 @@ async function setupBandwidthSaving(browser) {
         await attach(page);
     }
 
-    console.log('🧊 省流模式已开启：拦截 图片/媒体/字体/CSS + 第三方统计域名');
+    console.log('🧊 省流模式已开启：拦截 图片/媒体/字体 + 第三方统计域名');
 }
 
 function logBandwidthStats() {
@@ -330,61 +487,45 @@ function logBandwidthStats() {
     }
 }
 
+function resetBandwidthStats() {
+    for (const key of Object.keys(bandwidthStats.byType)) delete bandwidthStats.byType[key];
+    for (const key of Object.keys(bandwidthStats.byTracker)) delete bandwidthStats.byTracker[key];
+}
+
 // ==================== 主流程 ====================
 
-async function main() {
-    console.log('🚀 AdsPower + Puppeteer 注册脚本\n');
-    console.log('='.repeat(60));
+const proxy = {
+    url: `${FIXED_PROXY_TYPE}://${FIXED_PROXY_USER}:${FIXED_PROXY_PASSWORD}@${FIXED_PROXY_HOST}:${FIXED_PROXY_PORT}`,
+    host: FIXED_PROXY_HOST,
+    port: FIXED_PROXY_PORT,
+    username: FIXED_PROXY_USER,
+    password: FIXED_PROXY_PASSWORD,
+};
 
-    // ─── 1. 获取任务 ───
-    console.log('\n📋 获取 REGISTER 任务...');
-    const task = await getTask(['REGISTER']);
-    if (!task) {
-        console.log('❌ 没有待处理的 REGISTER 任务，请先在 crawler_task 表中准备数据');
-        return;
-    }
+let lastTaskStartedAt = 0;
+let currentTask = null;
+let shuttingDown = false;
 
-    // ─── 2. 创建新环境（带固定代理） ───
-    // TODO: 临时使用固定环境 106 测试，测试完恢复 createProfile
-    console.log('\n🔧 使用固定环境 106...');
-    console.log(`🎯 使用环境: user_id=${userId}`);
+/**
+ * 两条任务之间保持 10~15 分钟随机间隔
+ */
+async function waitForTaskInterval() {
+    if (!lastTaskStartedAt) return;
+    const interval = TASK_INTERVAL_BASE_MS + Math.floor(Math.random() * (TASK_INTERVAL_JITTER_MS + 1));
+    const waitMs = lastTaskStartedAt + interval - Date.now();
+    if (waitMs <= 0) return;
+    console.log(`⏲️ 距上次任务开始不足 ${Math.round(interval / 60000)} 分钟，等待 ${Math.ceil(waitMs / 1000)}s...`);
+    await sleep(waitMs);
+}
 
-    // 构造代理对象（供 signupCrawler 的 page.authenticate 使用）
-    const proxy = {
-        url: `${FIXED_PROXY_TYPE}://${FIXED_PROXY_HOST}:${FIXED_PROXY_PORT}`,
-        host: FIXED_PROXY_HOST,
-        port: FIXED_PROXY_PORT,
-        username: '',
-        password: '',
-    };
-
-    // ─── 3. 启动 AdsPower 浏览器 ───
-    console.log('\n🔧 启动 AdsPower 浏览器环境...');
-    const browserData = await startBrowser(userId);
-    console.log(`✅ 浏览器已启动`);
-    console.log(`   WebSocket: ${browserData.ws?.puppeteer || browserData.ws}`);
-
-    // ─── 4. 等待浏览器就绪 ───
-    console.log('\n⏳ 等待浏览器就绪...');
-    await waitForBrowser(browserData.ws?.puppeteer || browserData.ws);
-
-    // ─── 5. 连接 Puppeteer ───
-    console.log('\n🔗 连接 Puppeteer...');
-    const browser = await puppeteer.connect({
-        browserWSEndpoint: browserData.ws?.puppeteer || browserData.ws,
-        defaultViewport: null,
-    });
-    console.log('✅ Puppeteer 已连接');
-
-    // ─── 5.5 开启省流拦截 ───
-    console.log('\n🧊 开启省流拦截...');
-    await setupBandwidthSaving(browser);
-
-    // ─── 6. 执行注册 ───
-    console.log('\n▶️  开始执行注册流程...\n');
-    console.log('='.repeat(60));
+async function executeTask(task) {
+    console.log(`\n========== 处理任务 #${task.id} ==========`);
+    console.log(`   用户名: ${task.username}, 邮箱: ${task.email}`);
 
     await updateTaskStatus(task.id, 'processing');
+    currentTask = task;
+    lastTaskStartedAt = Date.now();
+    resetBandwidthStats();
 
     let result;
     try {
@@ -394,37 +535,81 @@ async function main() {
         result = { success: false, retryable: true, error: err.message };
     }
 
-    // ─── 7. 处理结果 ───
     console.log(`\n========== 任务 #${task.id} 结果 ==========`);
-    if (result.success) {
-        console.log('✅ 任务执行成功');
-        await updateTaskStatus(task.id, 'completed');
-    } else if (result.retryable) {
-        console.log(`🔄 任务需重试: ${result.error}`);
-        await incrementRetryCount(task.id);
-        await updateTaskStatus(task.id, 'retry');
-    } else {
-        console.log(`❌ 任务失败: ${result.error}`);
-        await updateTaskStatus(task.id, 'failed');
+    try {
+        if (result.success) {
+            console.log('✅ 任务执行成功');
+            await updateTaskStatus(task.id, 'completed');
+        } else if (result.retryable) {
+            console.log(`🔄 任务需重试: ${result.error}`);
+            await incrementRetryCount(task.id);
+            await updateTaskStatus(task.id, 'retry');
+        } else {
+            console.log(`❌ 任务失败: ${result.error}`);
+            await updateTaskStatus(task.id, 'failed');
+        }
+    } finally {
+        currentTask = null;
+        logBandwidthStats();
     }
-
-    // ─── 8. 清理 ───
-    console.log('\n🔌 断开 Puppeteer...');
-    await browser.disconnect();
-    console.log('✅ Puppeteer 已断开');
-
-    await stopBrowser(userId);
-
-    // 删除环境（暂时注释，后续手动清理）
-    // await deleteProfile(userId);
-
-    logBandwidthStats();
-
-    console.log('\n🎉 脚本完成！');
 }
 
+async function mainLoop() {
+    console.log('🚀 AdsPower + Puppeteer 注册调度器\n');
+    console.log('='.repeat(60));
+
+    while (!shuttingDown) {
+        try {
+            await ensureBrowser();
+
+            console.log('\n📋 获取 REGISTER 任务...');
+            const task = await getTask(['REGISTER']);
+            if (!task) {
+                await sleep(POLL_INTERVAL);
+                continue;
+            }
+
+            await waitForTaskInterval();
+            if (shuttingDown) break;
+            await executeTask(task);
+        } catch (e) {
+            if (e.adspowerFatal) throw e;
+            console.error('💥 主调度器异常:', e.message);
+            console.log(`⏳ ${POLL_INTERVAL / 1000}s 后重试...`);
+            await sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+async function shutdown(signal) {
+    if (shuttingDown) process.exit(1);
+    shuttingDown = true;
+    console.log(`\n\n👋 收到 ${signal}，正在关闭调度器...`);
+
+    if (currentTask) {
+        try {
+            await updateTaskStatus(currentTask.id, 'pending');
+            console.log(`   ↩️ 任务 #${currentTask.id} 已回滚为 pending`);
+        } catch (e) {
+            console.error(`   ⚠️  回滚任务 #${currentTask.id} 失败: ${e.message}`);
+        }
+    }
+
+    try {
+        if (browser) browser.disconnect();
+        console.log('   🔌 Puppeteer 已断开（AdsPower 浏览器保持运行）');
+    } catch (e) {
+        console.error(`   ⚠️  断开失败: ${e.message}`);
+    }
+
+    process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
 // ─── 运行 ───
-main().catch(err => {
+mainLoop().catch(err => {
     console.error('\n❌ 错误:', err.message);
     if (err.stack) console.error(err.stack);
     process.exit(1);

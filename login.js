@@ -500,6 +500,25 @@ async function submitLoginForm(page) {
     }
 
     console.log('   ⚠️  登录提交后页面未跳转');
+    try {
+        const diag = await page.evaluate(() => {
+            const pick = (sel) => Array.from(document.querySelectorAll(sel))
+                .map(el => (el.innerText || el.textContent || '').trim())
+                .filter(Boolean)
+                .slice(0, 5);
+            return {
+                alerts: pick('[role="alert"], .error, [class*="error" i], [class*="alert" i], [class*="message" i]'),
+                bodyText: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 500),
+                emailValue: document.querySelector('input[type="email"], input[name*="email" i], input[name="login"]')?.value || '',
+            };
+        });
+        console.log('   页面错误信息:', JSON.stringify(diag.alerts));
+        console.log('   body:', diag.bodyText);
+        console.log('   已填邮箱:', diag.emailValue);
+        await page.screenshot({ path: 'login-failed.png', fullPage: true });
+    } catch (e) {
+        console.log('   诊断失败:', e.message);
+    }
     return false;
 }
 
@@ -534,8 +553,10 @@ async function updateAccountInDb(email, loginIp, cookiesJson) {
     }
 }
 
-export async function loginCrawler(task, proxy, _cookies = null) {
-    console.log('🚀 启动 CloakBrowser (Login 爬虫)...\n');
+export async function loginCrawler(task, proxy, _cookies = null, opts = {}) {
+    const { browser: externalBrowser = null, context = null } = opts || {};
+    const useExternal = !!(externalBrowser && context);
+    console.log(`🚀 启动${useExternal ? ' AdsPower（外部上下文）' : ' CloakBrowser'} (Login 爬虫)...\n`);
 
     console.log(`👤 姓名: ${task.username}`);
     console.log(`📧 邮箱: ${task.email}`);
@@ -559,34 +580,43 @@ export async function loginCrawler(task, proxy, _cookies = null) {
             console.log(`🖥️  当前平台: ${platform} (${isLinux ? '无头模式' : '窗口模式'})`);
             console.log(`   📡 代理: ${proxy.host}:${proxy.port}`);
 
-            // 启动 CloakBrowser
-            browser = await launch({
-                headless: isLinux,
-                proxy: proxy.url,
-                humanize: true,
-                timezone: 'America/New_York',
-                locale: 'en-US',
-                viewport: { width: 1920, height: 1080 },
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--disable-gpu',
-                ]
-            });
+            if (useExternal) {
+                browser = externalBrowser;
+                console.log('✅ 使用外部浏览器上下文');
+            } else {
+                // 启动 CloakBrowser
+                browser = await launch({
+                    headless: isLinux,
+                    proxy: proxy.url,
+                    humanize: true,
+                    timezone: 'America/New_York',
+                    locale: 'en-US',
+                    viewport: { width: 1920, height: 1080 },
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-gpu',
+                    ]
+                });
+            }
 
             console.log('📖 创建新页面...');
-            const page = await browser.newPage();
-            await applyStealthPatches(page);
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+            const page = useExternal ? await context.newPage() : await browser.newPage();
+            if (!useExternal) {
+                await applyStealthPatches(page);
+                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+            }
 
-            // 代理认证
-            await page.authenticate({
-                username: proxy.username,
-                password: proxy.password,
-            });
-            console.log('   ✅ 代理认证已设置');
+            // 代理认证（AdsPower 外部浏览器自己管理代理凭据，覆盖成空值反而会断网）
+            if (!useExternal) {
+                await page.authenticate({
+                    username: proxy.username,
+                    password: proxy.password,
+                });
+                console.log('   ✅ 代理认证已设置');
+            }
 
             page.setDefaultNavigationTimeout(60000);
             page.setDefaultTimeout(30000);
@@ -627,7 +657,7 @@ export async function loginCrawler(task, proxy, _cookies = null) {
             // 在所有页面中查找 publisher 登录页（比直接取最后一个页面更健壮）
             let publisherPage = null;
             for (let attempt = 0; attempt < 6; attempt++) {
-                const allPages = await browser.pages();
+                const allPages = useExternal ? await context.pages() : await browser.pages();
                 for (const p of allPages) {
                     const pUrl = p.url();
                     if (pUrl.includes('publishers.adsterra.com/login')) {
@@ -644,7 +674,7 @@ export async function loginCrawler(task, proxy, _cookies = null) {
 
             if (!publisherPage) {
                 // 没找到 publisher 页面，检查是否有新标签页打开
-                const allPages = await browser.pages();
+                const allPages = useExternal ? await context.pages() : await browser.pages();
                 if (allPages.length > 1) {
                     // 取最后一个页面作为 publisher 页面
                     publisherPage = allPages[allPages.length - 1];
@@ -682,7 +712,7 @@ export async function loginCrawler(task, proxy, _cookies = null) {
             } else {
                 console.log(`💀 Cloudflare 挑战未通过 (${cfBeforeForm})，返回重试。`);
                 await publisherPage.screenshot({ path: `step4-cloudflare-${cfBeforeForm}.png`, fullPage: true });
-                await browser.close();
+                if (!useExternal) await browser.close();
                 return { success: false, retryable: true, error: `Cloudflare 挑战未通过 (${cfBeforeForm})` };
             }
 
@@ -775,13 +805,13 @@ export async function loginCrawler(task, proxy, _cookies = null) {
             if (loginIp) console.log(`🌐 登录 IP: ${loginIp}`);
             console.log('========================================\n');
 
-            await browser.close();
+            if (!useExternal) await browser.close();
             return { success: loginSuccess, url: finalUrl, loginIp };
 
         } catch (error) {
             console.error('❌ 发生错误:', error.message);
 
-            if (browser) {
+            if (browser && !useExternal) {
                 try { await browser.close(); } catch (_) {}
                 browser = null;
             }

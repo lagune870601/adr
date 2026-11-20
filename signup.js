@@ -448,6 +448,127 @@ async function waitForCloudflareChallenge(page, maxWaitMs = 90000) {
     return 'timeout';
 }
 
+// ==================== yopmail Cloudflare 盾保护 ====================
+
+/**
+ * 只检测 yopmail 的 Cloudflare 5 秒盾状态，不触碰任何 DOM
+ */
+async function yopmailShieldState(page) {
+    return page.evaluate(() => {
+        const title = document.title || '';
+        const text = document.body?.innerText || '';
+        const hasChallengeText = /just a moment|checking your browser|verify you are human|请稍候|正在检查|稍等/i.test(title + ' ' + text);
+        const hasChallengeFrame = Array.from(document.querySelectorAll('iframe'))
+            .some(f => /challenges\.cloudflare\.com|turnstile/i.test(f.src || ''));
+        const hasChallengeDom = !!document.querySelector('#challenge-stage, #challenge-form, .cf-turnstile');
+        return {
+            title,
+            hasChallengeText,
+            hasChallengeFrame,
+            hasChallengeDom,
+            active: hasChallengeText || hasChallengeFrame || hasChallengeDom,
+        };
+    });
+}
+
+/**
+ * 等 yopmail 的 Cloudflare 盾自行通过；期间不做任何点击/删除
+ */
+async function waitForYopmailShield(page, maxWaitMs = 60000) {
+    console.log('   ⏳ 检测 yopmail Cloudflare 盾...');
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+        const s = await yopmailShieldState(page).catch(() => null);
+        if (!s) return 'unknown';
+        if (!s.active) {
+            console.log(`   ✅ yopmail 盾已通过 (${Math.round((Date.now() - start) / 1000)}s)`);
+            return 'passed';
+        }
+        console.log(`   🔄 yopmail 盾进行中... (${Math.round((Date.now() - start) / 1000)}s) title="${s.title}"`);
+        await sleep(2000);
+    }
+    console.log('   ⚠️  yopmail 盾等待超时，继续尝试...');
+    return 'timeout';
+}
+
+/**
+ * 只清理明确的广告容器；Cloudflare 盾激活时完全跳过，
+ * 避免把 Turnstile 的遮挡层/弹窗当成广告一起关掉
+ */
+async function dismissYopmailAds(page) {
+    const shield = await yopmailShieldState(page).catch(() => ({ active: false }));
+    if (shield.active) {
+        console.log('   🛡️  Cloudflare 盾激活中，跳过广告清理');
+        return false;
+    }
+
+    const AD_SCOPE = [
+        'ins.adsbygoogle',
+        '[id^="google_ads"]',
+        '[id*="google_ads"]',
+        '[id*="advert"]',
+        '[class*="advert"]',
+        '[id*="popunder"]',
+        '[class*="popunder"]',
+        'iframe[src*="googlesyndication"]',
+        'iframe[src*="doubleclick"]',
+    ].join(', ');
+
+    await page.evaluate((adScope) => {
+        document.querySelectorAll(adScope).forEach(el => { try { el.remove(); } catch (_) {} });
+        document.querySelectorAll(`${adScope} button, ${adScope} [class*="close" i]`).forEach(el => {
+            try { el.click(); } catch (_) {}
+        });
+    }, AD_SCOPE).catch(() => {});
+    return true;
+}
+
+/**
+ * 进入邮箱后等待收件箱就绪：Cloudflare 盾可能延迟出现，
+ * 期间只观察状态，不点击/删除任何元素；最多等待 maxWaitMs
+ */
+async function waitForInboxReady(page, maxWaitMs = 60000) {
+    console.log(`   ⏳ 等待收件箱就绪（最多 ${Math.round(maxWaitMs / 1000)}s，观察 Cloudflare 盾）...`);
+    const start = Date.now();
+    while (Date.now() - start <= maxWaitMs) {
+        const s = await page.evaluate(() => {
+            const title = document.title || '';
+            const text = document.body?.innerText || '';
+            const shield = /just a moment|checking your browser|verify you are human|请稍候|正在检查/i.test(title + ' ' + text)
+                || Array.from(document.querySelectorAll('iframe')).some(f => /challenges\.cloudflare\.com|turnstile/i.test(f.src || ''))
+                || !!document.querySelector('#challenge-stage, #challenge-form, .cf-turnstile');
+            const out = {
+                url: location.href,
+                title,
+                shield,
+                nbmail: document.getElementById('nbmail')?.innerText || '',
+                hasInbox: !!document.getElementById('ifinbox'),
+            };
+            try {
+                const doc = document.getElementById('ifinbox')?.contentDocument;
+                if (doc) {
+                    out.itemCount = doc.querySelectorAll('.m').length;
+                    const m = (doc.body?.innerHTML || '').match(/finrmail\(([^)]*)\)/);
+                    out.finrmail = m ? m[1].replace(/\s+/g, '') : null;
+                }
+            } catch (e) {
+                out.inboxError = e.message;
+            }
+            return out;
+        }).catch(e => ({ error: e.message }));
+
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        console.log(`      [${elapsed}s] shield=${s.shield} title="${s.title}" nbmail="${s.nbmail}" items=${s.itemCount} finrmail=${s.finrmail ?? '-'}`);
+        if (s.itemCount > 0) {
+            console.log('   ✅ 收件箱已出现邮件');
+            return 'mail';
+        }
+        await sleep(3000);
+    }
+    console.log('   ⏳ 收件箱等待结束，仍未看到邮件');
+    return 'timeout';
+}
+
 /**
  * @param {object} task - 任务对象 { id, username, email, ... }
  * @param {object} proxy - 代理对象 { host, port, username, password, url }
@@ -480,12 +601,14 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
 
         let browser;
         let proxyManager;  // 用于 confirm link 阶段的代理
+        let context = null; // 外部浏览器模式下，每次尝试使用独立上下文
 
         try {
             if (isExternalBrowser) {
-                // 使用外部传入的浏览器（AdsPower 等）
+                // 使用外部传入的浏览器（AdsPower 等），每次尝试新建独立上下文
                 browser = existingBrowser;
-                console.log('✅ 使用外部浏览器实例');
+                context = await browser.createBrowserContext();
+                console.log('✅ 使用外部浏览器实例（新上下文）');
             } else {
                 const platform = os.platform();
                 console.log(`🖥️  当前平台: ${platform} (${isLinux ? '无头模式' : '窗口模式'})`);
@@ -509,17 +632,25 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                 });
             }
 
-            console.log('📖 创建新页面...');
-            const page = await browser.newPage();
-            await applyStealthPatches(page);
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+            const openPage = () => context ? context.newPage() : browser.newPage();
+            const listPages = () => context ? context.pages() : browser.pages();
 
-            // 代理认证
-            await page.authenticate({
-                username: proxy.username,
-                password: proxy.password,
-            });
-            console.log('   ✅ 代理认证已设置');
+            console.log('📖 创建新页面...');
+            const page = await openPage();
+            if (!isExternalBrowser) {
+                // AdsPower 是真实浏览器，有自己的指纹/UA，覆盖反而会让 Turnstile 校验失败
+                await applyStealthPatches(page);
+                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+            }
+
+            // 代理认证（AdsPower 外部浏览器自己管理代理凭据，覆盖成空值反而会断网）
+            if (!isExternalBrowser) {
+                await page.authenticate({
+                    username: proxy.username,
+                    password: proxy.password,
+                });
+                console.log('   ✅ 代理认证已设置');
+            }
 
             // 设置默认超时
             page.setDefaultNavigationTimeout(60000);
@@ -620,7 +751,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
 
             if (startEarningResult.found) {
                 // 记录点击前的所有标签页
-                const pagesBefore = await browser.pages();
+                const pagesBefore = await listPages();
                 console.log(`📑 点击前有 ${pagesBefore.length} 个标签页`);
 
                 // 点击按钮
@@ -642,7 +773,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                 await sleep(30000);
 
                 // 获取所有标签页
-                const pagesAfter = await browser.pages();
+                const pagesAfter = await listPages();
                 console.log(`📑 点击后有 ${pagesAfter.length} 个标签页`);
 
                 // 查找新的标签页（排除 adsterra.com 主站和 cloudflare blob）
@@ -679,8 +810,10 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
 
                     try {
                         await targetPage.bringToFront();
-                        await applyStealthPatches(targetPage);
-                        await targetPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+                        if (!isExternalBrowser) {
+                            await applyStealthPatches(targetPage);
+                            await targetPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+                        }
                         // 为新标签页设置代理认证（新标签不继承 page.authenticate）
                         await targetPage.authenticate({
                             username: proxy.username,
@@ -1057,59 +1190,47 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                             const chosen = messengerOptions[Math.floor(Math.random() * messengerOptions.length)];
                             console.log(`   🎯 随机选择: "${chosen.text}"`);
 
-                            // 使用 Puppeteer 原生 click 点击选项（更可靠）
-                            let optionClicked = false;
-                            try {
-                                // 方法1: 通过文本内容点击
-                                const optionEl = await targetPage.evaluateHandle((text) => {
-                                    const selectors = ['[role="option"]', 'li[data-value]', '.MuiMenuItem-root', 'ul[role="listbox"] li'];
-                                    for (const sel of selectors) {
-                                        const els = document.querySelectorAll(sel);
-                                        for (const el of els) {
-                                            if (el.textContent?.trim() === text) return el;
+                            // MUI MenuItem 需要完整的指针/鼠标事件序列才会触发选中；
+                            // 隐藏的移动端菜单项也会命中同一文本，必须过滤为可见元素
+                            const optionClicked = await targetPage.evaluate((text) => {
+                                const selectors = ['[role="option"]', 'li[data-value]', '.MuiMenuItem-root', 'ul[role="listbox"] li'];
+                                for (const sel of selectors) {
+                                    for (const el of document.querySelectorAll(sel)) {
+                                        if (el.textContent?.trim() !== text) continue;
+                                        const rect = el.getBoundingClientRect();
+                                        const style = getComputedStyle(el);
+                                        if (!rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none') continue;
+                                        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                                            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
                                         }
+                                        return true;
                                     }
-                                    return null;
-                                }, chosen.text);
-
-                                if (optionEl && optionEl.asElement()) {
-                                    await optionEl.asElement().click();
-                                    optionClicked = true;
-                                    console.log(`   ✅ 已点击选项元素`);
                                 }
-                            } catch (e) {
-                                console.warn(`   ⚠️  方法1失败: ${e.message}`);
-                            }
-
-                            // 方法2: 如果方法1失败，用 evaluate 点击
-                            if (!optionClicked) {
-                                console.log('   🔄 尝试备选点击方式...');
-                                await targetPage.evaluate((text) => {
-                                    const selectors = ['[role="option"]', 'li[data-value]', '.MuiMenuItem-root', 'ul[role="listbox"] li'];
-                                    for (const sel of selectors) {
-                                        const els = document.querySelectorAll(sel);
-                                        for (const el of els) {
-                                            if (el.textContent?.trim() === text) {
-                                                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                                                el.click();
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }, chosen.text);
-                            }
+                                return false;
+                            }, chosen.text);
+                            console.log(`   ${optionClicked ? '✅ 已选中选项' : '❌ 未找到可见选项'}`);
                             await sleep(800);
+
+                            // 校验下拉框已显示选中的值
+                            const selectText = await targetPage.$eval(
+                                '#mui-component-select-messenger',
+                                el => el.textContent?.trim() || ''
+                            );
+                            if (selectText === chosen.text) {
+                                console.log(`   ✅ Messenger 已选中: "${selectText}"`);
+                            } else {
+                                console.warn(`   ⚠️  Messenger 未选中，当前显示: "${selectText}"`);
+                            }
 
                             // 等待 Messenger Account 输入框变为可输入
                             console.log('   ⏳ 等待 Messenger Account 输入框变为可输入...');
+                            let accountEnabled = false;
                             for (let i = 0; i < 10; i++) {
-                                const disabled = await targetPage.$eval('#text-field-messengerAccount', el => el.disabled);
-                                if (!disabled) {
-                                    console.log(`   ✅ 输入框已可输入`);
-                                    break;
-                                }
+                                accountEnabled = await targetPage.$eval('#text-field-messengerAccount', el => !el.disabled);
+                                if (accountEnabled) break;
                                 await sleep(500);
                             }
+                            console.log(`   ${accountEnabled ? '✅ 输入框已可输入' : '⚠️  输入框仍不可输入'}`);
 
                             // 生成随机账号
                             const format = MESSENGER_FORMATS[chosen.text];
@@ -1119,14 +1240,15 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                             const account = generateRandomAccount(format?.format || 'default');
                             console.log(`   📝 生成 ${chosen.text} 账号: "${account}"`);
 
-                            // 输入账号
-                            await targetPage.click('#text-field-messengerAccount');
-                            await targetPage.type('#text-field-messengerAccount', account, { delay: 50 });
-                            await sleep(500);
+                            if (accountEnabled) {
+                                await targetPage.click('#text-field-messengerAccount');
+                                await targetPage.type('#text-field-messengerAccount', account, { delay: 50 });
+                                await sleep(500);
 
-                            // 验证
-                            const actualValue = await targetPage.$eval('#text-field-messengerAccount', el => el.value);
-                            console.log(`   ✅ 实际输入: "${actualValue}"${actualValue === account ? ' ✔' : ' ✗'}`);
+                                // 验证
+                                const actualValue = await targetPage.$eval('#text-field-messengerAccount', el => el.value);
+                                console.log(`   ✅ 实际输入: "${actualValue}"${actualValue === account ? ' ✔' : ' ✗'}`);
+                            }
                         }
 
                         // 步骤 7: 国家下拉框选中 "United States"
@@ -1443,30 +1565,39 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                 // 步骤 13: 打开 yopmail 查看确认邮件
                                 console.log('\n📬 步骤 13: 打开 yopmail 查看确认邮件...');
 
-                                // 关闭当前浏览器
-                                console.log('   🔒 关闭当前浏览器...');
-                                if (!isExternalBrowser) await browser.close();
+                                let yopmailPage;
+                                if (isExternalBrowser) {
+                                    // 与 adsterra 在同一上下文打开，借助真实浏览器通过 Cloudflare 5 秒盾
+                                    console.log('   🧭 在同一个 AdsPower 上下文打开 yopmail...');
+                                    yopmailPage = await openPage();
+                                } else {
+                                    // 关闭当前浏览器
+                                    console.log('   🔒 关闭当前浏览器...');
+                                    await browser.close();
 
-                                // 启动新浏览器，不挂代理
-                                console.log('   🌐 启动新浏览器（无代理）...');
-                                browser = await launch({
-                                    headless: isLinux,
-                                    humanize: true,
-                                    timezone: 'America/New_York',
-                                    locale: 'en-US',
-                                    viewport: { width: 1920, height: 1080 },
-                                    args: [
-                                        '--no-sandbox',
-                                        '--disable-setuid-sandbox',
-                                        '--disable-dev-shm-usage',
-                                        '--disable-accelerated-2d-canvas',
-                                        '--disable-gpu',
-                                    ]
-                                });
+                                    // 启动新浏览器，不挂代理
+                                    console.log('   🌐 启动新浏览器（无代理）...');
+                                    browser = await launch({
+                                        headless: isLinux,
+                                        humanize: true,
+                                        timezone: 'America/New_York',
+                                        locale: 'en-US',
+                                        viewport: { width: 1920, height: 1080 },
+                                        args: [
+                                            '--no-sandbox',
+                                            '--disable-setuid-sandbox',
+                                            '--disable-dev-shm-usage',
+                                            '--disable-accelerated-2d-canvas',
+                                            '--disable-gpu',
+                                        ]
+                                    });
+                                    yopmailPage = await browser.newPage();
+                                }
 
-                                const yopmailPage = await browser.newPage();
-                                await applyStealthPatches(yopmailPage);
-                                await yopmailPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+                                if (!isExternalBrowser) {
+                                    await applyStealthPatches(yopmailPage);
+                                    await yopmailPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+                                }
                                 yopmailPage.setDefaultNavigationTimeout(60000);
                                 yopmailPage.setDefaultTimeout(30000);
                                 await yopmailPage.setViewport({ width: 1920, height: 1080 });
@@ -1483,52 +1614,18 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                 }
                                 await sleep(3000);
 
-                                // 关闭广告弹窗
+                                // 先等 Cloudflare 5 秒盾自行通过，再做任何 DOM 清理；
+                                // 否则关闭广告的点击会把 Turnstile 弹窗一起关掉，导致永远过不了盾
+                                await waitForYopmailShield(yopmailPage, 60000);
+
+                                // 关闭广告弹窗（只清理明确的广告容器，盾激活时跳过）
                                 console.log('   🧹 关闭广告弹窗...');
-                                for (let attempt = 0; attempt < 5; attempt++) {
-                                    await yopmailPage.evaluate(() => {
-                                        // 关闭各种可能的弹窗/广告
-                                        const closeSelectors = [
-                                            '[aria-label="Close"]',
-                                            '[aria-label="close"]',
-                                            '.close',
-                                            '.dismiss',
-                                            '[class*="close" i]',
-                                            '[class*="dismiss" i]',
-                                            'button[class*="close" i]',
-                                            'div[class*="popup" i] button',
-                                            'div[class*="modal" i] button',
-                                            'div[class*="overlay" i] button',
-                                            'div[class*="ad" i] button',
-                                            'div[class*="ad" i] [class*="close" i]',
-                                            'iframe + button',
-                                            'button:has(svg)',
-                                        ];
-                                        for (const sel of closeSelectors) {
-                                            try {
-                                                const els = document.querySelectorAll(sel);
-                                                for (const el of els) {
-                                                    if (el.offsetParent !== null) {  // 可见元素
-                                                        el.click();
-                                                    }
-                                                }
-                                            } catch (_) {}
-                                        }
-                                        // 移除遮挡层
-                                        const overlaySelectors = [
-                                            'div[class*="overlay" i]',
-                                            'div[class*="popup" i]',
-                                            'div[class*="modal" i]',
-                                            'div[class*="advertisement" i]',
-                                            'div[id*="google_ads" i]',
-                                            'ins.adsbygoogle',
-                                        ];
-                                        for (const sel of overlaySelectors) {
-                                            try {
-                                                document.querySelectorAll(sel).forEach(el => el.remove());
-                                            } catch (_) {}
-                                        }
-                                    });
+                                for (let attempt = 0; attempt < 3; attempt++) {
+                                    const cleaned = await dismissYopmailAds(yopmailPage);
+                                    if (!cleaned) {
+                                        await waitForYopmailShield(yopmailPage, 60000);
+                                        continue;
+                                    }
                                     await sleep(500);
                                 }
                                 console.log('   ✅ 广告弹窗处理完成');
@@ -1564,7 +1661,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                                 // 按 Enter 键
                                                 await yopmailPage.keyboard.press('Enter');
                                                 console.log('   ✅ 已按 Enter，进入邮箱');
-                                                await sleep(10000)
+                                                await sleep(3000);
                                                 break;
                                             }
                                         }
@@ -1577,44 +1674,78 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                     if (!isExternalBrowser) await browser.close();
                                     return { success: false, retryable: false, error: '未找到 yopmail 邮箱输入框' };
                                 } else {
-                                    // 等待邮箱加载
-                                    await sleep(5000);
+                                    // 进入邮箱后先等 1 分钟：Cloudflare 的 5 秒盾可能延迟出现/生效，
+                                    // 期间不点击任何东西，只观察收件箱状态
+                                    await waitForInboxReady(yopmailPage, 60000);
 
-                                    // 再次清理广告
-                                    await yopmailPage.evaluate(() => {
-                                        ['div[class*="overlay" i]', 'div[class*="popup" i]', 'div[class*="modal" i]', 'div[class*="ad" i]', 'ins.adsbygoogle']
-                                            .forEach(sel => document.querySelectorAll(sel).forEach(el => { try { el.remove(); } catch (_) {} }));
-                                    });
+                                    // 再次清理广告（同样跳过盾激活的状态）
+                                    await dismissYopmailAds(yopmailPage);
                                     await sleep(2000);
 
                                     await yopmailPage.screenshot({ path: 'step13-yopmail-inbox.png', fullPage: true });
                                     console.log('   📸 yopmail 截图: step13-yopmail-inbox.png');
 
                                     // 步骤 14: 在邮件列表中查找 Adsterra 确认邮件并点击
+                                    // 确认邮件可能延迟数分钟到达，轮询收件箱
                                     console.log('\n✉️  步骤 14: 查找 Adsterra 确认邮件...');
 
-                                    // yopmail 邮件列表在 #ifinbox iframe 中
-                                    const emailClicked = await yopmailPage.evaluate(() => {
-                                        const iframe = document.getElementById('ifinbox');
-                                        if (!iframe) return { found: false, error: 'ifinbox not found' };
-                                        try {
-                                            const doc = iframe.contentDocument || iframe.contentWindow?.document;
-                                            if (!doc) return { found: false, error: 'ifinbox doc not accessible' };
+                                    const EMAIL_WAIT_MS = 10 * 60 * 1000;
+                                    const EMAIL_POLL_MS = 15 * 1000;
+                                    const emailDeadline = Date.now() + EMAIL_WAIT_MS;
+                                    let emailClicked = { found: false };
+                                    let pollRound = 0;
 
-                                            const items = doc.querySelectorAll('.m, .msg, .lm, [class*="message" i], [class*="email" i], div[onclick]');
-                                            for (const item of items) {
-                                                const text = (item.textContent || '').toLowerCase();
-                                                if (text.includes('complete your registration') ||
-                                                    (text.includes('adsterra') && text.includes('confirm'))) {
-                                                    item.click();
-                                                    return { found: true, text: (item.textContent || '').trim().slice(0, 200) };
+                                    while (true) {
+                                        // yopmail 邮件列表在 #ifinbox iframe 中
+                                        emailClicked = await yopmailPage.evaluate(() => {
+                                            const iframe = document.getElementById('ifinbox');
+                                            if (!iframe) return { found: false, error: 'ifinbox not found' };
+                                            try {
+                                                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                                                if (!doc) return { found: false, error: 'ifinbox doc not accessible' };
+
+                                                const items = doc.querySelectorAll('.m, .msg, .lm');
+                                                for (const item of items) {
+                                                    const text = (item.textContent || '').toLowerCase();
+                                                    const isAdsterra = text.includes('adsterra');
+                                                    const looksLikeConfirm = /complete your registration|confirm|verify|activat/.test(text);
+                                                    if (looksLikeConfirm && (isAdsterra || text.includes('complete your registration'))) {
+                                                        item.click();
+                                                        return { found: true, text: (item.textContent || '').trim().slice(0, 200) };
+                                                    }
                                                 }
+                                                return {
+                                                    found: false,
+                                                    error: 'no matching email',
+                                                    itemCount: items.length,
+                                                    subjects: Array.from(items).slice(0, 8).map(i => (i.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80)),
+                                                };
+                                            } catch (e) {
+                                                return { found: false, error: e.message };
                                             }
-                                            return { found: false, error: 'no matching email', itemCount: items.length };
-                                        } catch (e) {
-                                            return { found: false, error: e.message };
+                                        });
+
+                                        if (emailClicked.found) break;
+                                        if (Date.now() >= emailDeadline) break;
+
+                                        console.log(`   ⏳ 收件箱暂无确认邮件（${emailClicked.itemCount ?? 0} 封），${EMAIL_POLL_MS / 1000}s 后重试...`);
+                                        if (emailClicked.subjects?.length) {
+                                            console.log('   当前邮件:', emailClicked.subjects.join(' | '));
                                         }
-                                    });
+                                        await sleep(EMAIL_POLL_MS);
+                                        pollRound++;
+
+                                        // yopmail 页面会自行刷新收件箱；刚打开时 /inbox 会先返回 403/空箱，
+                                        // 频繁手动点刷新反而一直停在 403，所以只低频整页重载兜底
+                                        if (pollRound % 4 === 0) {
+                                            await yopmailPage.goto(`https://yopmail.net/?login=${encodeURIComponent(emailPrefix)}`, {
+                                                waitUntil: 'load',
+                                                timeout: 60000,
+                                            }).catch(() => {});
+                                            await waitForYopmailShield(yopmailPage, 60000);
+                                            await sleep(3000);
+                                        }
+                                    }
 
                                     console.log(`   邮件查找结果: ${JSON.stringify(emailClicked)}`);
 
@@ -1668,35 +1799,44 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                             console.log(`   ✅ Confirm email 链接: ${confirmLink.href}`);
                                             console.log(`   按钮文本: "${confirmLink.text}"`);
 
-                                            // 步骤 16: 关闭 yopmail 浏览器，重新打开代理浏览器访问 confirm 链接
+                                            // 步骤 16: 访问 confirm 链接
                                             console.log('\n🔗 步骤 16: 访问 confirm 链接...');
 
-                                            // 关闭 yopmail 浏览器
-                                            console.log('   🔒 关闭 yopmail 浏览器...');
-                                            if (!isExternalBrowser) await browser.close();
+                                            let confirmPage;
+                                            if (isExternalBrowser) {
+                                                // 与 adsterra 在同一上下文打开，复用已通过的 Cloudflare 状态
+                                                console.log('   🧭 在同一个 AdsPower 上下文打开 confirm 链接...');
+                                                await yopmailPage.close().catch(() => {});
+                                                confirmPage = await openPage();
+                                            } else {
+                                                // 关闭 yopmail 浏览器
+                                                console.log('   🔒 关闭 yopmail 浏览器...');
+                                                await browser.close();
 
-                                            // 重新启动代理浏览器
-                                            console.log('   🌐 启动代理浏览器...');
+                                                // 重新启动代理浏览器
+                                                console.log('   🌐 启动代理浏览器...');
+                                                browser = await launch({
+                                                    headless: isLinux,
+                                                    proxy: proxy.url,
+                                                    humanize: true,
+                                                    timezone: 'America/New_York',
+                                                    locale: 'en-US',
+                                                    viewport: { width: 1920, height: 1080 },
+                                                    args: [
+                                                        '--no-sandbox',
+                                                        '--disable-setuid-sandbox',
+                                                        '--disable-dev-shm-usage',
+                                                        '--disable-accelerated-2d-canvas',
+                                                        '--disable-gpu',
+                                                    ]
+                                                });
+                                                confirmPage = await browser.newPage();
+                                            }
 
-                                            browser = await launch({
-                                                headless: isLinux,
-                                                proxy: proxy.url,
-                                                humanize: true,
-                                                timezone: 'America/New_York',
-                                                locale: 'en-US',
-                                                viewport: { width: 1920, height: 1080 },
-                                                args: [
-                                                    '--no-sandbox',
-                                                    '--disable-setuid-sandbox',
-                                                    '--disable-dev-shm-usage',
-                                                    '--disable-accelerated-2d-canvas',
-                                                    '--disable-gpu',
-                                                ]
-                                            });
-
-                                            const confirmPage = await browser.newPage();
-                                            await applyStealthPatches(confirmPage);
-                                            await confirmPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+                                            if (!isExternalBrowser) {
+                                                await applyStealthPatches(confirmPage);
+                                                await confirmPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+                                            }
                                             confirmPage.setDefaultNavigationTimeout(60000);
                                             confirmPage.setDefaultTimeout(30000);
                                             await confirmPage.setViewport({ width: 1920, height: 1080 });
@@ -1747,13 +1887,18 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                                 }
                                             }
 
-                                            // 步骤 16-17 完成，关闭浏览器并返回
+                                            // 步骤 16-17 完成
                                             console.log('\n========================================\n');
                                             console.log('✅ Sign Up 爬虫 + 邮件确认 完成！');
                                             if (!isExternalBrowser) await browser.close();
 
-
-                                            return (await loginCrawler(task, proxy, null));
+                                            const loginOpts = isExternalBrowser ? { browser, context } : {};
+                                            const loginResult = await loginCrawler(task, proxy, null, loginOpts);
+                                            if (!loginResult.success) {
+                                                console.log(`   ⚠️ 登录失败（SIGN UP 已完成，不重试）: ${loginResult.error || '未知错误'}`);
+                                                return { success: false, retryable: false, error: loginResult.error || '登录失败' };
+                                            }
+                                            return loginResult;
                                         } else {
                                             console.warn('   ⚠️  未找到 Confirm email 链接');
                                             if (confirmLink) {
@@ -1794,7 +1939,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                         // 获取页面元数据
                         const metadata = await targetPage.evaluate(() => {
                             return {
-                                url: url,
+                                url: location.href,
                                 title: document.title,
                                 h1s: Array.from(document.querySelectorAll('h1')).map(h => h.textContent.trim().slice(0, 100)),
                                 forms: document.querySelectorAll('form').length,
@@ -1864,6 +2009,11 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                 // SIGN UP 之后失败 → 不可重试
                 console.error('❌ SIGN UP 后流程异常');
                 return { success: false, retryable: false, error: error.message };
+            }
+        } finally {
+            if (context) {
+                await context.close().catch(() => {});
+                context = null;
             }
         }
 
