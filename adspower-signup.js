@@ -287,16 +287,18 @@ async function restartProfile() {
 
 /**
  * 用极小请求确认浏览器出口网络可用（代理失效时 ws 仍可连接）
+ * 注意：gstatic/google 的 generate_204 经此 SOCKS5 代理会被 Chrome 报
+ * net::ERR_ABORTED，换成一个返回 200 的极简端点
  */
 async function checkBrowserNetwork(b) {
     let page;
     try {
         page = await b.newPage();
-        const res = await page.goto('https://www.gstatic.com/generate_204', {
-            waitUntil: 'load',
+        const res = await page.goto('https://api.ipify.org/?format=json', {
+            waitUntil: 'domcontentloaded',
             timeout: 15000,
         });
-        return !!res && (res.status() === 204 || res.status() === 200);
+        return !!res && res.status() === 200;
     } catch (e) {
         console.warn(`   ⚠️ 网络自检失败: ${e.message}`);
         return false;
@@ -408,13 +410,7 @@ async function setupBandwidthSaving(browser) {
         if (!page || attached.has(page)) return;
         attached.add(page);
 
-        try {
-            await page.setRequestInterception(true);
-        } catch {
-            return; // 页面可能正在关闭
-        }
-
-        page.on('request', (req) => {
+        const onRequest = (req) => {
             try {
                 const url = req.url();
                 if (!/^https?:/i.test(url)) {
@@ -447,7 +443,16 @@ async function setupBandwidthSaving(browser) {
             } catch {
                 // 请求可能已被处理或页面已关闭
             }
-        });
+        };
+
+        // 必须先注册 handler 再开启拦截：反过来会让进行中的请求无人处理而报
+        // net::ERR_ABORTED / Navigation timeout
+        page.on('request', onRequest);
+        try {
+            await page.setRequestInterception(true);
+        } catch {
+            page.off('request', onRequest);
+        }
     };
 
     // 覆盖之后新开的页面（signup.js 内部会多次 newPage）
