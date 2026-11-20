@@ -19,8 +19,8 @@ import { getTask, updateTaskStatus, incrementRetryCount } from './shared/db.js';
 // ==================== 配置 ====================
 
 const ADSPOWER_API = 'http://127.0.0.1:50325';
-const ADSPOWER_API_KEY = '4ca74a76da338ab4c3c6e556d0ee9e6200a33e3013953cf7';
-const userId = 'k1j99ybe'; // 临时：serial_number=105
+const ADSPOWER_API_KEY = 'eff07fd8e7e01eaadfd547a394b70fe8008fbf3dd5166600';
+const userId = 'k1j9jsy9'; // 临时：serial_number=105
 
 // 固定代理配置（SOCKS5）
 const FIXED_PROXY_HOST = '104.233.202.50';
