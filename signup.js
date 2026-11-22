@@ -1689,7 +1689,7 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                     // 确认邮件可能延迟数分钟到达，轮询收件箱
                                     console.log('\n✉️  步骤 14: 查找 Adsterra 确认邮件...');
 
-                                    const EMAIL_WAIT_MS = 10 * 60 * 1000;
+                                    const EMAIL_WAIT_MS = 5 * 60 * 1000;
                                     const EMAIL_POLL_MS = 15 * 1000;
                                     const emailDeadline = Date.now() + EMAIL_WAIT_MS;
                                     let emailClicked = { found: false };
@@ -1924,11 +1924,18 @@ export async function signupCrawler(task, proxy, existingBrowser = null) {
                                 console.log(`   最终标题: "${emailPageInfo?.title}"`);
                                 await targetPage.screenshot({ path: 'step12-timeout.png', fullPage: true });
                                 console.log('   📸 超时截图: step12-timeout.png');
+                                if (!isExternalBrowser) await browser.close();
+                                // 注册已提交且写了 adsterra_account 记录，重试会产生重复账号
+                                return { success: false, retryable: false, error: '未检测到确认邮件页面（注册提交后超时）' };
                             }
                         } else if (signupBtnInfo.found && signupBtnInfo.disabled) {
                             console.log('   ⚠️  SIGN UP 按钮存在但处于禁用状态，无法提交');
+                            if (!isExternalBrowser) await browser.close();
+                            return { success: false, retryable: true, error: 'SIGN UP 按钮处于禁用状态' };
                         } else {
                             console.log('   ⚠️  未找到 SIGN UP 按钮');
+                            if (!isExternalBrowser) await browser.close();
+                            return { success: false, retryable: true, error: '未找到 SIGN UP 按钮' };
                         }
 
                         // 截图
