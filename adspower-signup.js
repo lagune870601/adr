@@ -1,19 +1,20 @@
 /**
- * adspower-signup.js — AdsPower 浏览器 + Puppeteer 注册脚本
+ * adspower-signup.js — AdsPower 浏览器 + Puppeteer 任务调度器
  *
- * 通过 AdsPower Local API 创建新浏览器环境（带固定代理），用 Puppeteer 连接，
- * 执行 Adsterra Publisher 注册流程，完成后自动删除环境。
+ * 通过 AdsPower Local API 连接固定浏览器环境（带固定代理），用 Puppeteer 执行
+ * Adsterra Publisher 的 REGISTER（注册）和 LOGIN（登录）任务。
  *
  * 用法：
  *   node adspower-signup.js
  *
  * 前置条件：
  *   - AdsPower 客户端已启动，Local API 已开启（端口 50325）
- *   - crawler_task 表中有 REGISTER 类型的待处理任务
+ *   - crawler_task 表中有 REGISTER 或 LOGIN 类型的待处理任务
  */
 
 import puppeteer from 'puppeteer-core';
 import { signupCrawler } from './signup.js';
+import { loginCrawler } from './login.js';
 import { getTask, updateTaskStatus, incrementRetryCount } from './shared/db.js';
 
 // ==================== 配置 ====================
@@ -524,7 +525,7 @@ async function waitForTaskInterval() {
 }
 
 async function executeTask(task) {
-    console.log(`\n========== 处理任务 #${task.id} ==========`);
+    console.log(`\n========== 处理任务 #${task.id} (类型: ${task.task_type}) ==========`);
     console.log(`   用户名: ${task.username}, 邮箱: ${task.email}`);
 
     await updateTaskStatus(task.id, 'processing');
@@ -534,10 +535,25 @@ async function executeTask(task) {
 
     let result;
     try {
-        result = await signupCrawler(task, proxy, browser);
+        if (task.task_type === 'LOGIN') {
+            // loginCrawler 不自己建上下文，需由调度器创建并在任务结束后关闭
+            const context = await browser.createBrowserContext();
+            try {
+                result = await loginCrawler(task, proxy, null, { browser, context });
+            } finally {
+                await context.close().catch(() => {});
+            }
+        } else {
+            result = await signupCrawler(task, proxy, browser);
+        }
     } catch (err) {
-        console.error('💥 注册流程异常:', err.message);
+        console.error(`💥 ${task.task_type === 'LOGIN' ? '登录' : '注册'}流程异常:`, err.message);
         result = { success: false, retryable: true, error: err.message };
+    }
+
+    // loginCrawler 对“提交后未跳转”只返回 success:false，无 retryable → 视为可重试
+    if (task.task_type === 'LOGIN' && !result.success && result.retryable === undefined) {
+        result = { ...result, retryable: true, error: result.error || '登录未跳转（页面未进入控制台）' };
     }
 
     console.log(`\n========== 任务 #${task.id} 结果 ==========`);
@@ -560,15 +576,15 @@ async function executeTask(task) {
 }
 
 async function mainLoop() {
-    console.log('🚀 AdsPower + Puppeteer 注册调度器\n');
+    console.log('🚀 AdsPower + Puppeteer 注册/登录调度器\n');
     console.log('='.repeat(60));
 
     while (!shuttingDown) {
         try {
             await ensureBrowser();
 
-            console.log('\n📋 获取 REGISTER 任务...');
-            const task = await getTask(['REGISTER']);
+            console.log('\n📋 获取 REGISTER/LOGIN 任务...');
+            const task = await getTask(['REGISTER', 'LOGIN']);
             if (!task) {
                 await sleep(POLL_INTERVAL);
                 continue;
