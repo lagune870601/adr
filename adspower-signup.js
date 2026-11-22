@@ -581,8 +581,6 @@ async function mainLoop() {
 
     while (!shuttingDown) {
         try {
-            await ensureBrowser();
-
             console.log('\n📋 获取 REGISTER/LOGIN 任务...');
             const task = await getTask(['REGISTER', 'LOGIN']);
             if (!task) {
@@ -592,6 +590,9 @@ async function mainLoop() {
 
             await waitForTaskInterval();
             if (shuttingDown) break;
+
+            // 仅在有任务时连接并自检出口 IP，避免空轮询反复消耗代理流量
+            await ensureBrowser();
             await executeTask(task);
         } catch (e) {
             if (e.adspowerFatal) throw e;
