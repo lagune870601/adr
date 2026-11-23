@@ -1,6 +1,15 @@
 [
   {
     "url": "https://shop1.smacad.com/",
-    "script": "<script async src=\"https://js.mbidadm.com/static/scripts.js\" data-admpid=\"472979\"></script>"
+    "ads": [
+      {
+        "script": "<script async src=\"https://js.mbidadm.com/static/scripts.js\" data-admpid=\"472979\"></script>",
+        "position": "bottom-right"
+      },
+      {
+        "script": "<script async src=\"https://js.mbidadm.com/static/scripts.js\" data-admpid=\"473598\"></script>",
+        "position": "bottom-left"
+      }
+    ]
   }
 ]

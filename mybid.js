@@ -7,8 +7,11 @@
  *     [--click-rate=1] [--headless]
  *
  * 简化版：保留指纹、排程、点击三项能力，不再对广告请求做域名白名单。
- * 每个广告链接独立排程：日访问量服从泊松分布（默认 300），按美国东部时间的
- * 小时权重分配（凌晨稀少、晚间最高）。每次访问开始时先决定是否点击。
+ * 每个页面独立排程：日访问量服从泊松分布（默认 300），按美国东部时间的
+ * 小时权重分配（凌晨稀少、晚间最高）。页面可配置多个广告 script，每个广告
+ * 按弹窗位置（左右各半 × 上中下三等分共 6 区）检测；每次访问对每个广告
+ * 独立掷 1% 决定是否点击，命中时点击最先出现且完整可见的那个，否则等任一
+ * 广告出现后停留 5~10 秒。
  * 每轮访问使用全新的浏览器进程（随机 --fingerprint seed），保证轮与轮之间
  * 指纹不可关联；轮内新建隐私上下文，并通过 createBrowserContext({ proxyServer })
  * 指定本地 mitmproxy socks5（默认 socks5://127.0.0.1:18008，可用 SOCKS_PROXY 覆盖，
@@ -37,10 +40,19 @@ const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
 // 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
 const SCHEDULE_ENABLED = true;
-// 每次访问开始即决定是否点击：默认 100% 等待广告并点击，调低后其余访问仅停留 20 秒后关闭
+// 每个广告在每次访问中独立以 CLICK_PROBABILITY 决定是否点击；一次访问最多点 1 个
 const CLICK_PROBABILITY = 0.01;
 const VISITS_PER_DAY = 300;
-const NON_CLICK_DWELL_MS = 20000;
+// 非点击访问：最多等任一配置位置出现广告 10 秒，出现后随机停留 5~10 秒；始终不出现则直接结束
+const NON_CLICK_AD_WAIT_SEC = 10;
+const NON_CLICK_DWELL_MIN_MS = 5000;
+const NON_CLICK_DWELL_MAX_MS = 10000;
+// 广告弹窗可占据的 6 个位置：横向左右 × 纵向上中下
+const AD_POSITIONS = [
+    'top-left', 'top-right',
+    'center-left', 'center-right',
+    'bottom-left', 'bottom-right',
+];
 const SCHEDULE_SLEEP_CHUNK_MS = 30000;
 
 // ==================== 代理与 IP 分配 ====================
@@ -128,11 +140,33 @@ function loadEntries(file) {
             throw new Error(`第 ${i + 1} 项不是对象`);
         }
         const url = typeof item.url === 'string' ? item.url.trim() : '';
-        const script = typeof item.script === 'string' ? item.script.trim() : '';
         if (!url) {
             throw new Error(`第 ${i + 1} 项缺少有效 url`);
         }
-        return { url, script };
+        if (!Array.isArray(item.ads) || item.ads.length === 0) {
+            throw new Error(`第 ${i + 1} 项缺少非空 ads 数组`);
+        }
+        const ads = item.ads.map((ad, j) => {
+            if (!ad || typeof ad !== 'object') {
+                throw new Error(`第 ${i + 1} 项第 ${j + 1} 个广告不是对象`);
+            }
+            const script = typeof ad.script === 'string' ? ad.script.trim() : '';
+            const position = typeof ad.position === 'string' ? ad.position.trim() : '';
+            if (!script) {
+                throw new Error(`第 ${i + 1} 项第 ${j + 1} 个广告缺少有效 script`);
+            }
+            if (!AD_POSITIONS.includes(position)) {
+                throw new Error(`第 ${i + 1} 项第 ${j + 1} 个广告 position 非法: ` +
+                    `${position || '(空)'}，可选值: ${AD_POSITIONS.join(', ')}`);
+            }
+            return { script, position };
+        });
+        const dup = ads.map((ad) => ad.position).filter((p, k, all) => all.indexOf(p) !== k);
+        if (dup.length > 0) {
+            console.warn(`⚠️ 第 ${i + 1} 项存在重复位置: ${[...new Set(dup)].join(', ')}` +
+                '（几何无法区分，按同区任一广告处理）');
+        }
+        return { url, ads };
     });
 }
 
@@ -148,24 +182,24 @@ function hostnameOf(u) {
 
 // ==================== 本地空页面 ====================
 
-function buildHtml(script) {
+function buildHtml(ads) {
     return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-${script}
+${ads.map((ad) => ad.script).join('\n')}
 </head>
 <body>helloworld</body>
 </html>`;
 }
 
 /**
- * 主 frame 导航到配置域名时，直接返回本地空页面（含广告脚本），
+ * 主 frame 导航到配置域名时，直接返回本地空页面（含全部广告脚本），
  * 其余请求一律放行，不做域名白名单。
  */
 function setupRequestHandler(page, entry, roundState) {
     const initialHost = hostnameOf(entry.url);
-    const html = buildHtml(entry.script);
+    const html = buildHtml(entry.ads);
 
     page.setRequestInterception(true).catch(() => {});
     page.on('request', (req) => {
@@ -189,16 +223,23 @@ function setupRequestHandler(page, entry, roundState) {
 
 // ==================== 广告检测与点击 ====================
 
+/** 按中心点把视口内矩形归入 6 个位置之一：横向左右各半，纵向三等分 */
+function positionForRect(rect, vw, vh) {
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    const side = cx < vw / 2 ? 'left' : 'right';
+    const band = cy < vh / 3 ? 'top' : cy < (vh * 2) / 3 ? 'center' : 'bottom';
+    return `${band}-${side}`;
+}
+
 /**
- * 在主页面中查找已加载完成且已滑入视口的广告 iframe，返回其视口包围盒。
- * mBidadm 的广告是右下角 fixed 容器内的 iframe（native push 样式）。
+ * 收集主页面中已加载完成、且完整进入视口的广告 iframe，按中心点归入 6 个位置。
+ * 同一位置只保留 DOM 顺序第一个。
  */
-async function findAdRect(page) {
-    return page.evaluate(() => {
-        const vw = window.innerWidth;
-        const vh = window.innerHeight;
-        const frames = Array.from(document.querySelectorAll('iframe'));
-        for (const f of frames) {
+async function findVisibleAds(page) {
+    const { vw, vh, rects } = await page.evaluate(() => {
+        const out = [];
+        for (const f of document.querySelectorAll('iframe')) {
             const rect = f.getBoundingClientRect();
             if (rect.width <= 0 || rect.height <= 0) continue;
 
@@ -206,7 +247,8 @@ async function findAdRect(page) {
             if (style.display === 'none' || style.visibility === 'hidden') continue;
 
             // 必须完整进入视口才可点击
-            if (rect.left < 0 || rect.top < 0 || rect.right > vw || rect.bottom > vh) continue;
+            if (rect.left < 0 || rect.top < 0 ||
+                rect.right > window.innerWidth || rect.bottom > window.innerHeight) continue;
 
             let doc;
             try {
@@ -217,10 +259,20 @@ async function findAdRect(page) {
             if (!doc || !doc.body || !doc.body.innerHTML.trim()) continue;
             if (doc.readyState !== 'complete') continue;
 
-            return { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+            out.push({ x: rect.left, y: rect.top, width: rect.width, height: rect.height });
         }
-        return null;
+        return { vw: window.innerWidth, vh: window.innerHeight, rects: out };
     });
+
+    const seen = new Set();
+    const ads = [];
+    for (const rect of rects) {
+        const position = positionForRect(rect, vw, vh);
+        if (seen.has(position)) continue;
+        seen.add(position);
+        ads.push({ position, rect });
+    }
+    return ads;
 }
 
 function randomPointInRect(rect) {
@@ -230,41 +282,47 @@ function randomPointInRect(rect) {
     };
 }
 
-/** 轮询等待广告加载，命中后点击；超时或广告未进入视口则跳过 */
-async function waitForAdAndClick(page, params, wlog) {
-    const deadline = Date.now() + params.adTimeoutSec * 1000;
-    let rect = null;
-
+/** 轮询等待给定位置中第一个完整可见的广告，返回 {position, rect}；超时或停止时返回 null */
+async function waitForAdInPositions(page, positions, timeoutSec) {
+    const deadline = Date.now() + timeoutSec * 1000;
     while (!stopping && Date.now() < deadline) {
         try {
-            rect = await findAdRect(page);
+            const visible = await findVisibleAds(page);
+            const hit = visible.find((ad) => positions.has(ad.position));
+            if (hit) return hit;
         } catch {
-            rect = null;
+            // 单次读取失败（页面未就绪/已关闭）不致命，继续轮询
         }
-        if (rect) break;
         await sleep(AD_POLL_STEP_MS);
     }
+    return null;
+}
 
-    if (!rect) {
-        wlog(`   ⚠️ ${params.adTimeoutSec} 秒内未检测到广告，跳过点击`);
-        return false;
+/** 轮询等待命中位置的广告出现，命中后点击；超时或未进入视口则跳过。返回点击的位置或 null */
+async function waitForAdAndClick(page, flagged, params, wlog) {
+    const hit = await waitForAdInPositions(page, flagged, params.adTimeoutSec);
+    if (!hit) {
+        wlog(`   ⚠️ ${params.adTimeoutSec} 秒内未检测到命中位置的广告，跳过点击`);
+        return null;
     }
 
     const delay = CLICK_DELAY_MIN_MS + Math.random() * (CLICK_DELAY_MAX_MS - CLICK_DELAY_MIN_MS);
-    wlog(`   🎯 广告已加载，${(delay / 1000).toFixed(1)} 秒后点击`);
+    wlog(`   🎯 [${hit.position}] 广告已加载，${(delay / 1000).toFixed(1)} 秒后点击`);
     await sleep(delay);
-    if (stopping) return false;
+    if (stopping) return null;
 
-    // 延迟期间广告可能仍在移动，点击前重新取一次实时坐标
+    // 延迟期间广告可能仍在移动，点击前重新取一次同位置的实时坐标
     let clickRect = null;
     try {
-        clickRect = await findAdRect(page);
+        const fresh = await findVisibleAds(page);
+        const same = fresh.find((ad) => ad.position === hit.position);
+        clickRect = same ? same.rect : null;
     } catch {
         clickRect = null;
     }
     if (!clickRect) {
         wlog('   ⚠️ 点击前广告不在视口内，跳过点击');
-        return false;
+        return null;
     }
 
     const { x, y } = randomPointInRect(clickRect);
@@ -272,15 +330,35 @@ async function waitForAdAndClick(page, params, wlog) {
         await page.mouse.move(x, y, { steps: 10 });
         await sleep(100);
         await page.mouse.click(x, y, { delay: 80 });
-        wlog(`   👆 已点击广告 (${x}, ${y})`);
+        wlog(`   👆 已点击广告 [${hit.position}] (${x}, ${y})`);
     } catch (e) {
         wlog(`   ⚠️ 点击广告失败: ${e.message}`);
-        return false;
+        return null;
     }
 
     wlog(`   ⏳ 点击后停留 ${params.afterClickSec} 秒`);
     await sleep(params.afterClickSec * 1000);
-    return true;
+    return hit.position;
+}
+
+/** 非点击访问：等任一配置位置的广告出现后随机停留 5~10 秒，模拟真实曝光会话 */
+async function dwellAfterAd(page, positions, wlog) {
+    const hit = await waitForAdInPositions(page, positions, NON_CLICK_AD_WAIT_SEC);
+    if (!hit) {
+        wlog(`   ⚠️ ${NON_CLICK_AD_WAIT_SEC} 秒内未检测到广告，跳过停留`);
+        return;
+    }
+
+    const dwellMs = NON_CLICK_DWELL_MIN_MS +
+        Math.random() * (NON_CLICK_DWELL_MAX_MS - NON_CLICK_DWELL_MIN_MS);
+    wlog(`   🙈 [${hit.position}] 广告已出现，停留 ${(dwellMs / 1000).toFixed(1)} 秒`);
+
+    let remaining = dwellMs;
+    while (remaining > 0 && !stopping) {
+        const chunk = Math.min(remaining, 500);
+        await sleep(chunk);
+        remaining -= chunk;
+    }
 }
 
 // ==================== 浏览器生命周期 ====================
@@ -300,7 +378,7 @@ let prewarmedSlot = null;
 let prewarmPromise = null;
 let activeSlot = null;
 
-const stats = { rounds: 0, skipped: 0, lastSeed: null };
+const stats = { rounds: 0, skipped: 0, lastSeed: null, clicksByPos: {} };
 
 /**
  * 启动一个全新的浏览器进程。每次启动随机生成指纹 seed，
@@ -500,13 +578,24 @@ function finishRound(skipped) {
     if (stats.rounds % STATS_LOG_EVERY === 0) {
         tslog(`📊 统计: 完成 ${stats.rounds} 轮 | 跳过 ${stats.skipped} 轮 | ` +
             `最近 seed ${stats.lastSeed ?? '-'}`);
+        const posRate = Object.entries(stats.clicksByPos)
+            .map(([pos, clicks]) =>
+                `${pos} ${clicks}/${stats.rounds} (${((clicks / stats.rounds) * 100).toFixed(1)}%)`)
+            .join(' | ');
+        if (posRate) tslog(`📊 位置点击率: ${posRate}`);
     }
 }
 
-/** 执行一次访问；click 为 true 时等待广告并点击，否则仅停留 20 秒 */
-async function visitOnce(state, params, click, icon = '🔵') {
+/** 执行一次访问；每个广告独立掷 1% 决定是否点击，命中则点第一个出现的，否则停留 5~10 秒 */
+async function visitOnce(state, params, icon = '🔵') {
     const { entry } = state;
     const linkNo = state.index + 1;
+    const configured = new Set(entry.ads.map((ad) => ad.position));
+    const flagged = new Set(
+        entry.ads
+            .filter(() => Math.random() < params.clickProbability)
+            .map((ad) => ad.position),
+    );
 
     let allocation;
     try {
@@ -565,18 +654,21 @@ async function visitOnce(state, params, click, icon = '🔵') {
 
         await page.goto(entry.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
-        if (click) {
-            await waitForAdAndClick(page, params, tslog);
+        let clickedPosition = null;
+        if (flagged.size > 0) {
+            clickedPosition = await waitForAdAndClick(page, flagged, params, tslog);
+            if (clickedPosition) {
+                stats.clicksByPos[clickedPosition] = (stats.clicksByPos[clickedPosition] || 0) + 1;
+            }
         } else if (!stopping) {
-            tslog(`   🙈 本次不点击，停留 ${NON_CLICK_DWELL_MS / 1000} 秒`);
-            await sleep(NON_CLICK_DWELL_MS);
+            await dwellAfterAd(page, configured, tslog);
         }
 
         tslog(`✅ 链接 #${linkNo} 本次访问结束`);
         console.log(`ROUND_SUMMARY link=${linkNo} url=${entry.url} ` +
             `proxy=${LOCAL_PROXY} ip=${allocation.ip} ip_id=${allocation.id} ` +
             `seed=${slot.seed} fp=${fpInfo.fp} gl=${fpInfo.gl} ` +
-            `click=${click ? 1 : 0}`);
+            `click=${clickedPosition ? 1 : 0} clicked_pos=${clickedPosition || '-'}`);
     } catch (e) {
         tslog(`❌ 链接 #${linkNo} 访问异常: ${e.message}`);
     } finally {
@@ -618,7 +710,7 @@ async function scheduleLoop(entries, params) {
         }
 
         next.events.shift();
-        await visitOnce(next, params, Math.random() < params.clickProbability);
+        await visitOnce(next, params);
 
         if (stopping) break;
 
@@ -635,7 +727,7 @@ async function roundRobinLoop(entries, params) {
     while (!stopping) {
         const state = states[cursor];
         cursor = (cursor + 1) % states.length;
-        await visitOnce(state, params, Math.random() < params.clickProbability, '🔁');
+        await visitOnce(state, params, '🔁');
     }
 }
 
@@ -645,11 +737,16 @@ async function run() {
     const params = parseArgs();
     const entries = loadEntries(params.urlsFile);
     headlessFlag = params.headless;
+    for (const ad of entries.flatMap((e) => e.ads)) {
+        stats.clicksByPos[ad.position] = stats.clicksByPos[ad.position] || 0;
+    }
 
     console.log('🚀 启动 CloakBrowser (mBidadm 访问器)...');
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
+    console.log(`🎯 广告配置: 每页 ${entries.map((e) => e.ads.length).join('/')} 个 | ` +
+        `位置 ${[...new Set(entries.flatMap((e) => e.ads.map((ad) => ad.position)))].join(', ')}`);
     console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
-    console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MS / 1000} 秒`);
+    console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 每广告点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MIN_MS / 1000}~${NON_CLICK_DWELL_MAX_MS / 1000} 秒（广告出现后）`);
     console.log('🌍 出口策略: 每次访问从分配服务领取新 IP + 全新浏览器（独立 seed）+ 隐私上下文 + 本地 mitmproxy socks5');
     console.log(`🖥️  模式: ${params.headless ? '无头' : '有窗口'}`);
     console.log(`📡 本地代理: ${LOCAL_PROXY}（mitmproxy + botAnti3.py）`);
