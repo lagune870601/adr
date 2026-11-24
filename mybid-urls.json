@@ -4,11 +4,13 @@
     "ads": [
       {
         "script": "<script async src=\"https://js.mbidadm.com/static/scripts.js\" data-admpid=\"472979\"></script>",
-        "position": "bottom-right"
+        "position": "bottom-right",
+        "clickRate": 0
       },
       {
         "script": "<script async src=\"https://js.mbidadm.com/static/scripts.js\" data-admpid=\"473598\"></script>",
-        "position": "bottom-left"
+        "position": "bottom-left",
+        "clickRate": 1
       }
     ]
   }

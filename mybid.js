@@ -39,7 +39,8 @@ const CLICK_DELAY_MAX_MS = 3000;
 const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
 // 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
-const SCHEDULE_ENABLED = true;
+// 本地测试临时关闭，测完恢复 true
+const SCHEDULE_ENABLED = false;
 // 每个广告在每次访问中独立以 CLICK_PROBABILITY 决定是否点击；一次访问最多点 1 个
 const CLICK_PROBABILITY = 0.01;
 const VISITS_PER_DAY = 300;
@@ -159,7 +160,14 @@ function loadEntries(file) {
                 throw new Error(`第 ${i + 1} 项第 ${j + 1} 个广告 position 非法: ` +
                     `${position || '(空)'}，可选值: ${AD_POSITIONS.join(', ')}`);
             }
-            return { script, position };
+            const clickRate = ad.clickRate;
+            if (clickRate !== undefined &&
+                (typeof clickRate !== 'number' || !Number.isFinite(clickRate) ||
+                    clickRate < 0 || clickRate > 1)) {
+                throw new Error(`第 ${i + 1} 项第 ${j + 1} 个广告 clickRate 非法: ` +
+                    `${clickRate}（需 0~1 的数字）`);
+            }
+            return { script, position, clickRate };
         });
         const dup = ads.map((ad) => ad.position).filter((p, k, all) => all.indexOf(p) !== k);
         if (dup.length > 0) {
@@ -234,33 +242,63 @@ function positionForRect(rect, vw, vh) {
 
 /**
  * 收集主页面中已加载完成、且完整进入视口的广告 iframe，按中心点归入 6 个位置。
- * 同一位置只保留 DOM 顺序第一个。
+ * 同一位置只保留 DOM 顺序第一个。会递归进入同源子 iframe——部分广告脚本把
+ * 弹窗 iframe 嵌在一个覆盖全屏的容器 iframe 内，只看顶层会漏掉。
  */
 async function findVisibleAds(page) {
     const { vw, vh, rects } = await page.evaluate(() => {
         const out = [];
-        for (const f of document.querySelectorAll('iframe')) {
-            const rect = f.getBoundingClientRect();
-            if (rect.width <= 0 || rect.height <= 0) continue;
-
-            const style = window.getComputedStyle(f);
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-
-            // 必须完整进入视口才可点击
-            if (rect.left < 0 || rect.top < 0 ||
-                rect.right > window.innerWidth || rect.bottom > window.innerHeight) continue;
-
-            let doc;
+        const walk = (doc, offsetX, offsetY, depth) => {
+            if (depth > 5) return;
+            let frames;
             try {
-                doc = f.contentDocument;
+                frames = doc.querySelectorAll('iframe');
             } catch {
-                continue;
+                return;
             }
-            if (!doc || !doc.body || !doc.body.innerHTML.trim()) continue;
-            if (doc.readyState !== 'complete') continue;
+            for (const f of frames) {
+                const rect = f.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) continue;
 
-            out.push({ x: rect.left, y: rect.top, width: rect.width, height: rect.height });
-        }
+                let style;
+                try {
+                    style = doc.defaultView.getComputedStyle(f);
+                } catch {
+                    continue;
+                }
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+                let childDoc;
+                try {
+                    childDoc = f.contentDocument;
+                } catch {
+                    continue;
+                }
+                if (!childDoc) continue;
+
+                const abs = {
+                    x: offsetX + rect.left,
+                    y: offsetY + rect.top,
+                    width: rect.width,
+                    height: rect.height,
+                };
+                const bodyReady = childDoc.body &&
+                    childDoc.body.innerHTML.trim() && childDoc.readyState === 'complete';
+                // 必须完整进入视口才可点击
+                if (bodyReady &&
+                    abs.x >= 0 && abs.y >= 0 &&
+                    abs.x + abs.width <= window.innerWidth &&
+                    abs.y + abs.height <= window.innerHeight) {
+                    out.push(abs);
+                }
+                try {
+                    walk(childDoc, abs.x, abs.y, depth + 1);
+                } catch {
+                    // 访问子文档失败（跨域/已销毁），跳过
+                }
+            }
+        };
+        walk(document, 0, 0, 0);
         return { vw: window.innerWidth, vh: window.innerHeight, rects: out };
     });
 
@@ -298,11 +336,152 @@ async function waitForAdInPositions(page, positions, timeoutSec) {
     return null;
 }
 
+/** 点击并观察 2.5 秒，报告是否触发新标签或主页面跳转 */
+async function clickAndObserve(page, x, y, position, wlog) {
+    let ctx = null;
+    try {
+        ctx = page.browserContext();
+    } catch {
+        ctx = null;
+    }
+    const newTargets = [];
+    const onTarget = (target) => {
+        try {
+            if (target.type() === 'page') newTargets.push(target);
+        } catch {
+            // target 可能已失效
+        }
+    };
+    if (ctx && typeof ctx.on === 'function') ctx.on('targetcreated', onTarget);
+
+    const urlBefore = page.url();
+    try {
+        await page.mouse.move(x, y, { steps: 10 });
+        await sleep(100);
+        await page.mouse.click(x, y, { delay: 80 });
+        wlog(`   👆 已点击广告 [${position}] (${x}, ${y})`);
+    } finally {
+        await sleep(2500);
+        if (ctx && typeof ctx.off === 'function') ctx.off('targetcreated', onTarget);
+    }
+
+    for (const target of newTargets) {
+        let url = '';
+        try {
+            const p = await target.page();
+            url = p ? p.url() : target.url();
+        } catch {
+            url = '';
+        }
+        wlog(`   🪟 点击后新开标签: ${url || '(未知)'}`);
+    }
+    const urlAfter = page.url();
+    if (urlAfter !== urlBefore) {
+        wlog(`   🪟 点击后主页面跳转到: ${urlAfter}`);
+    }
+    if (newTargets.length === 0 && urlAfter === urlBefore) {
+        wlog('   🪟 点击后未检测到跳转或新标签');
+    }
+}
+
+/** 诊断用：打印所有 iframe 的几何与加载状态，并截图保存 */
+async function dumpIframes(page, wlog) {
+    let frames;
+    try {
+        frames = await page.evaluate(() => {
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            const out = [];
+            const walk = (doc, offsetX, offsetY, depth, prefix) => {
+                if (depth > 5) return;
+                let list;
+                try {
+                    list = doc.querySelectorAll('iframe');
+                } catch {
+                    return;
+                }
+                list.forEach((f, i) => {
+                    const r = f.getBoundingClientRect();
+                    const left = offsetX + r.left;
+                    const top = offsetY + r.top;
+                    let s = null;
+                    try {
+                        s = doc.defaultView.getComputedStyle(f);
+                    } catch {
+                        // ignore
+                    }
+                    let docState = 'null';
+                    let childDoc = null;
+                    try {
+                        childDoc = f.contentDocument;
+                        if (childDoc) {
+                            docState = `${childDoc.readyState}/` +
+                                `${childDoc.body ? childDoc.body.innerHTML.trim().length : 0}`;
+                        }
+                    } catch {
+                        docState = 'blocked';
+                    }
+                    const label = `${prefix}${i + 1}`;
+                    out.push({
+                        label,
+                        depth,
+                        src: (f.getAttribute('src') || f.getAttribute('srcdoc') || '(none)').slice(0, 120),
+                        x: Math.round(left), y: Math.round(top),
+                        w: Math.round(r.width), h: Math.round(r.height),
+                        fullyVisible: left >= 0 && top >= 0 &&
+                            left + r.width <= vw && top + r.height <= vh,
+                        display: s ? s.display : '?',
+                        visibility: s ? s.visibility : '?',
+                        opacity: s ? s.opacity : '?',
+                        docState,
+                    });
+                    if (childDoc && childDoc.documentElement) {
+                        try {
+                            walk(childDoc, left, top, depth + 1, `${label}.`);
+                        } catch {
+                            // 子文档不可遍历
+                        }
+                    }
+                });
+            };
+            walk(document, 0, 0, 0, '');
+            return out;
+        });
+    } catch (e) {
+        wlog(`   🔍 iframe 诊断失败: ${e.message}`);
+        return;
+    }
+    wlog(`   🔍 页面 iframe 共 ${frames.length} 个（含嵌套）`);
+    for (const f of frames) {
+        const indent = '   '.repeat(f.depth);
+        wlog(`      ${indent}#${f.label} ${f.x},${f.y} ${f.w}x${f.h} fully=${f.fullyVisible} ` +
+            `display=${f.display} visibility=${f.visibility} opacity=${f.opacity} ` +
+            `doc=${f.docState} src=${f.src}`);
+    }
+    try {
+        const dir = path.join(__dirname, 'logs');
+        fs.mkdirSync(dir, { recursive: true });
+        const shot = path.join(dir, `timeout-${Date.now()}.png`);
+        await page.screenshot({ path: shot });
+        wlog(`   📸 已截图: ${shot}`);
+    } catch (e) {
+        wlog(`   ⚠️ 截图失败: ${e.message}`);
+    }
+}
+
 /** 轮询等待命中位置的广告出现，命中后点击；超时或未进入视口则跳过。返回点击的位置或 null */
 async function waitForAdAndClick(page, flagged, params, wlog) {
     const hit = await waitForAdInPositions(page, flagged, params.adTimeoutSec);
     if (!hit) {
         wlog(`   ⚠️ ${params.adTimeoutSec} 秒内未检测到命中位置的广告，跳过点击`);
+        try {
+            const visible = await findVisibleAds(page);
+            wlog(`   🔍 当前完整可见的广告位置: ` +
+                `${visible.length > 0 ? visible.map((ad) => ad.position).join(', ') : '无'}`);
+        } catch {
+            // 页面可能已关闭，忽略诊断失败
+        }
+        await dumpIframes(page, wlog);
         return null;
     }
 
@@ -327,10 +506,7 @@ async function waitForAdAndClick(page, flagged, params, wlog) {
 
     const { x, y } = randomPointInRect(clickRect);
     try {
-        await page.mouse.move(x, y, { steps: 10 });
-        await sleep(100);
-        await page.mouse.click(x, y, { delay: 80 });
-        wlog(`   👆 已点击广告 [${hit.position}] (${x}, ${y})`);
+        await clickAndObserve(page, x, y, hit.position, wlog);
     } catch (e) {
         wlog(`   ⚠️ 点击广告失败: ${e.message}`);
         return null;
@@ -370,6 +546,16 @@ const BASE_ARGS = [
     '--ignore-certificate-errors',
 ];
 
+// 本地诊断用：VIEWPORT=1920x1080 固定视口尺寸；未设置时沿用真实窗口尺寸
+function parseViewport(raw) {
+    const m = /^(\d+)x(\d+)$/i.exec((raw || '').trim());
+    if (!m) return null;
+    const width = parseInt(m[1], 10);
+    const height = parseInt(m[2], 10);
+    return width > 0 && height > 0 ? { width, height } : null;
+}
+const LAUNCH_VIEWPORT = parseViewport(process.env.VIEWPORT);
+
 let headlessFlag = DEFAULT_HEADLESS;
 const activeContexts = new Set();
 let stopping = false;
@@ -386,14 +572,22 @@ const stats = { rounds: 0, skipped: 0, lastSeed: null, clicksByPos: {} };
  */
 async function launchFreshBrowser() {
     const seed = 10000 + Math.floor(Math.random() * 90000);
+    const extraArgs = [];
+    const launchOptions = {};
+    if (LAUNCH_VIEWPORT) {
+        extraArgs.push(`--window-size=${LAUNCH_VIEWPORT.width},${LAUNCH_VIEWPORT.height}`);
+        launchOptions.defaultViewport = LAUNCH_VIEWPORT;
+    }
     const b = await launch({
         headless: headlessFlag,
         humanize: true,
         timezone: 'America/New_York',
         locale: 'en-US',
-        args: [...BASE_ARGS, `--fingerprint=${seed}`],
+        args: [...BASE_ARGS, ...extraArgs, `--fingerprint=${seed}`],
+        ...(LAUNCH_VIEWPORT ? { launchOptions } : {}),
     });
-    tslog(`🧩 浏览器已启动（seed=${seed}，本轮独立指纹）`);
+    tslog(`🧩 浏览器已启动（seed=${seed}，本轮独立指纹` +
+        `${LAUNCH_VIEWPORT ? `，视口 ${LAUNCH_VIEWPORT.width}x${LAUNCH_VIEWPORT.height}` : ''}）`);
     return { browser: b, seed };
 }
 
@@ -522,7 +716,15 @@ async function readFingerprint(page) {
 
             const glCanvas = document.createElement('canvas');
             const gl = glCanvas.getContext('webgl2') || glCanvas.getContext('webgl');
-            return { fp: h, gl: gl ? 1 : 0 };
+            return {
+                fp: h,
+                gl: gl ? 1 : 0,
+                ua: navigator.userAgent,
+                uaMobile: navigator.userAgentData ? navigator.userAgentData.mobile : null,
+                platform: navigator.platform,
+                screen: `${screen.width}x${screen.height} dpr=${window.devicePixelRatio}`,
+                viewport: `${window.innerWidth}x${window.innerHeight}`,
+            };
         });
     } catch {
         return { fp: null, gl: null };
@@ -593,7 +795,7 @@ async function visitOnce(state, params, icon = '🔵') {
     const configured = new Set(entry.ads.map((ad) => ad.position));
     const flagged = new Set(
         entry.ads
-            .filter(() => Math.random() < params.clickProbability)
+            .filter((ad) => Math.random() < (ad.clickRate ?? params.clickProbability))
             .map((ad) => ad.position),
     );
 
@@ -646,6 +848,9 @@ async function visitOnce(state, params, icon = '🔵') {
         tslog(`   🎭 伪装 IP 已设为 ${allocation.ip}`);
 
         const fpInfo = await readFingerprint(page);
+        tslog(`   🖥️ UA ${fpInfo.ua}`);
+        tslog(`   🖥️ mobile=${fpInfo.uaMobile} platform=${fpInfo.platform} ` +
+            `screen=${fpInfo.screen} viewport=${fpInfo.viewport}`);
 
         page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
         page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
@@ -743,8 +948,10 @@ async function run() {
 
     console.log('🚀 启动 CloakBrowser (mBidadm 访问器)...');
     console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
-    console.log(`🎯 广告配置: 每页 ${entries.map((e) => e.ads.length).join('/')} 个 | ` +
-        `位置 ${[...new Set(entries.flatMap((e) => e.ads.map((ad) => ad.position)))].join(', ')}`);
+    console.log(`🎯 广告配置: 每页 ${entries.map((e) => e.ads.length).join('/')} 个 | 位置点击率 ` +
+        entries.flatMap((e) => e.ads)
+            .map((ad) => `${ad.position} ${((ad.clickRate ?? params.clickProbability) * 100).toFixed(0)}%`)
+            .join(' | '));
     console.log(`🔀 访问计划: ${SCHEDULE_ENABLED ? `开启（美国东部作息，每链接日均 ${params.visitsPerDay} 次）` : '关闭（多链接轮流连续访问，忽略日均计划）'}`);
     console.log(`⏱️  广告等待: ${params.adTimeoutSec.toFixed(0)} 秒 | 点击后停留: ${params.afterClickSec.toFixed(0)} 秒 | 每广告点击率: ${(params.clickProbability * 100).toFixed(0)}% | 非点击停留: ${NON_CLICK_DWELL_MIN_MS / 1000}~${NON_CLICK_DWELL_MAX_MS / 1000} 秒（广告出现后）`);
     console.log('🌍 出口策略: 每次访问从分配服务领取新 IP + 全新浏览器（独立 seed）+ 隐私上下文 + 本地 mitmproxy socks5');
