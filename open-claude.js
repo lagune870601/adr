@@ -11,14 +11,14 @@ const isLinux = os.platform() === 'linux';
 const LOGIN_URL = 'https://claude.ai/login';
 const TARGET_URL = 'https://claude.ai/new';
 
-const DEFAULT_ACCOUNT = 'rustic-meadow@md.qjwdzj.com';
+const DEFAULT_ACCOUNT = 'harbor@mmm.smacad.com';
 
 const PROXY = {
-    url: 'socks5://chenchao:chenchao@104.233.202.50:17893',
-    host: '104.233.202.50',
-    port: 17893,
-    username: 'chenchao',
-    password: 'chenchao',
+    url: 'socks5://7nah19794-region-Rand-sid-vaU152J3-t-5:e44sjgeu@us.novproxy.io:1000',
+    host: 'us.novproxy.io',
+    port: 1000,
+    username: '7nah19794-region-Rand-sid-vaU152J3-t-5',
+    password: 'e44sjgeu',
 };
 
 // ==================== 命令行参数解析 ====================

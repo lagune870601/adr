@@ -40,10 +40,10 @@ const AFTER_CLICK_SEC = 10;
 const AD_TIMEOUT_SEC = 60;
 // 访问计划开关：true 按美国东部作息计划访问，false 多链接轮流连续访问（改后重启生效）
 // 本地测试临时关闭，测完恢复 true
-const SCHEDULE_ENABLED = false;
+const SCHEDULE_ENABLED = true;
 // 每个广告在每次访问中独立以 CLICK_PROBABILITY 决定是否点击；一次访问最多点 1 个
 const CLICK_PROBABILITY = 0.01;
-const VISITS_PER_DAY = 300;
+const VISITS_PER_DAY = 3000;
 // 非点击访问：最多等任一配置位置出现广告 10 秒，出现后随机停留 5~10 秒；始终不出现则直接结束
 const NON_CLICK_AD_WAIT_SEC = 10;
 const NON_CLICK_DWELL_MIN_MS = 5000;
@@ -458,15 +458,15 @@ async function dumpIframes(page, wlog) {
             `display=${f.display} visibility=${f.visibility} opacity=${f.opacity} ` +
             `doc=${f.docState} src=${f.src}`);
     }
-    try {
-        const dir = path.join(__dirname, 'logs');
-        fs.mkdirSync(dir, { recursive: true });
-        const shot = path.join(dir, `timeout-${Date.now()}.png`);
-        await page.screenshot({ path: shot });
-        wlog(`   📸 已截图: ${shot}`);
-    } catch (e) {
-        wlog(`   ⚠️ 截图失败: ${e.message}`);
-    }
+    // try {
+    //     const dir = path.join(__dirname, 'logs');
+    //     fs.mkdirSync(dir, { recursive: true });
+    //     const shot = path.join(dir, `timeout-${Date.now()}.png`);
+    //     await page.screenshot({ path: shot });
+    //     wlog(`   📸 已截图: ${shot}`);
+    // } catch (e) {
+    //     wlog(`   ⚠️ 截图失败: ${e.message}`);
+    // }
 }
 
 /** 轮询等待命中位置的广告出现，命中后点击；超时或未进入视口则跳过。返回点击的位置或 null */

@@ -16,7 +16,7 @@ const DB_CONFIG = {
     database: 'ad',
 };
 
-const DEFAULT_ACCOUNT = 'janet.patterson@sendos.fr.nf';
+const DEFAULT_ACCOUNT = 'ruth_reynolds_2r@spam.aleh.de';
 
 const TARGET_URL = 'https://beta.publishers.adsterra.com/websites';
 const LOGIN_URL = 'https://beta.publishers.adsterra.com/login';
