@@ -2,7 +2,7 @@
  * mybid.js — 按美国东部时间作息调度访问，返回本地空页面并加载 mBidadm 广告脚本
  *
  * 用法:
- *   node mybid.js [--urls=./mybid-urls.json]
+ *   node mybid.js [--urls=https://.../mybid-urls.json]
  *     [--visits-per-day=300] [--ad-timeout-sec=60] [--after-click-sec=10]
  *     [--click-rate=1] [--headless]
  *
@@ -28,6 +28,7 @@ import { fileURLToPath } from 'url';
 import { etParts, etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const URLS_URL = 'https://replit.oss-cn-hangzhou.aliyuncs.com/mybid-urls.json';
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const DEFAULT_HEADLESS = process.env.HEADLESS === '1';
 
@@ -89,7 +90,7 @@ function parseArgs() {
     const envVisits = parseInt(process.env.VISITS_PER_DAY, 10);
 
     const params = {
-        urlsFile: path.join(__dirname, 'mybid-urls.json'),
+        urlsUrl: URLS_URL,
         adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : AD_TIMEOUT_SEC,
         afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
         clickProbability: Number.isFinite(envClickRate) && envClickRate >= 0 && envClickRate <= 1 ? envClickRate : CLICK_PROBABILITY,
@@ -99,7 +100,7 @@ function parseArgs() {
 
     for (const arg of args) {
         if (arg.startsWith('--urls=')) {
-            params.urlsFile = arg.slice('--urls='.length);
+            params.urlsUrl = arg.slice('--urls='.length);
         } else if (arg.startsWith('--ad-timeout-sec=')) {
             const v = parseFloat(arg.slice('--ad-timeout-sec='.length));
             if (Number.isFinite(v) && v > 0) params.adTimeoutSec = v;
@@ -122,16 +123,22 @@ function parseArgs() {
 
 // ==================== 数据列表 ====================
 
-function loadEntries(file) {
-    if (!fs.existsSync(file)) {
-        throw new Error(`数据列表文件不存在: ${file}`);
+async function loadEntries(url) {
+    let raw;
+    try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        }
+        raw = await res.text();
+    } catch (e) {
+        throw new Error(`数据列表下载失败 (${url}): ${e.message}`);
     }
-    const raw = fs.readFileSync(file, 'utf-8');
     let arr;
     try {
         arr = JSON.parse(raw);
     } catch (e) {
-        throw new Error(`数据列表文件不是合法 JSON: ${e.message}`);
+        throw new Error(`数据列表不是合法 JSON: ${e.message}`);
     }
     if (!Array.isArray(arr) || arr.length === 0) {
         throw new Error('数据列表必须是非空数组');
@@ -940,14 +947,14 @@ async function roundRobinLoop(entries, params) {
 
 async function run() {
     const params = parseArgs();
-    const entries = loadEntries(params.urlsFile);
+    const entries = await loadEntries(params.urlsUrl);
     headlessFlag = params.headless;
     for (const ad of entries.flatMap((e) => e.ads)) {
         stats.clicksByPos[ad.position] = stats.clicksByPos[ad.position] || 0;
     }
 
     console.log('🚀 启动 CloakBrowser (mBidadm 访问器)...');
-    console.log(`📋 数据列表: ${entries.length} 条 | 文件: ${params.urlsFile}`);
+    console.log(`📋 数据列表: ${entries.length} 条 | 来源: ${params.urlsUrl}`);
     console.log(`🎯 广告配置: 每页 ${entries.map((e) => e.ads.length).join('/')} 个 | 位置点击率 ` +
         entries.flatMap((e) => e.ads)
             .map((ad) => `${ad.position} ${((ad.clickRate ?? params.clickProbability) * 100).toFixed(0)}%`)
