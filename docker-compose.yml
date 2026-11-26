@@ -35,6 +35,12 @@ services:
       ip-allocator:
         condition: service_healthy
     environment:
+      MYBID_ACCOUNT_ID: "1"
+      DB_HOST: 166.0.19.103
+      DB_PORT: "13307"
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: ad
       ALLOCATOR_URL: http://ip-allocator:18010
       BOOTSTRAP_BASE: http://bootstrap.mitm.local:18080
       MITM_PORT: "18008"

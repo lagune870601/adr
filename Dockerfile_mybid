@@ -21,7 +21,7 @@ RUN npm install --omit=dev
 RUN pip3 install --no-cache-dir --upgrade pip \
  && pip3 install --no-cache-dir mitmproxy requests
 
-COPY botAnti3.py entrypoint.sh mybid.js mybid-urls.json ./
+COPY botAnti3.py entrypoint.sh mybid.js ./
 COPY shared/ ./shared/
 RUN chmod +x entrypoint.sh && mkdir -p logs
 

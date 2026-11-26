@@ -2,9 +2,11 @@
  * mybid.js — 按美国东部时间作息调度访问，返回本地空页面并加载 mBidadm 广告脚本
  *
  * 用法:
- *   node mybid.js [--urls=https://.../mybid-urls.json]
- *     [--visits-per-day=300] [--ad-timeout-sec=60] [--after-click-sec=10]
+ *   node mybid.js [--visits-per-day=300] [--ad-timeout-sec=60] [--after-click-sec=10]
  *     [--click-rate=1] [--headless]
+ *
+ * 数据列表来源: 数据库 mybid_account 表中 MYBID_ACCOUNT_ID 指定行的 url_config 字段，
+ * 启动时读取一次；DB_* 环境变量可覆盖 shared/db.js 中的默认连接参数。
  *
  * 简化版：保留指纹、排程、点击三项能力，不再对广告请求做域名白名单。
  * 每个页面独立排程：日访问量服从泊松分布（默认 300），按美国东部时间的
@@ -24,11 +26,20 @@
 import { launch } from 'cloakbrowser/puppeteer';
 import fs from 'fs';
 import path from 'path';
+import mysql from 'mysql2/promise';
 import { fileURLToPath } from 'url';
 import { etParts, etDayKey, nextDay, buildDayEvents } from './shared/visit-schedule.js';
+import { DB_CONFIG } from './shared/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const URLS_URL = 'https://replit.oss-cn-hangzhou.aliyuncs.com/mybid-urls.json';
+const envDbPort = parseInt(process.env.DB_PORT, 10);
+const DB = {
+    host: process.env.DB_HOST || DB_CONFIG.host,
+    port: Number.isInteger(envDbPort) && envDbPort > 0 ? envDbPort : DB_CONFIG.port,
+    user: process.env.DB_USER || DB_CONFIG.user,
+    password: process.env.DB_PASSWORD ?? DB_CONFIG.password,
+    database: process.env.DB_NAME || DB_CONFIG.database,
+};
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const DEFAULT_HEADLESS = process.env.HEADLESS === '1';
 
@@ -88,9 +99,13 @@ function parseArgs() {
     const envAfterClick = parseFloat(process.env.AFTER_CLICK_SEC);
     const envClickRate = parseFloat(process.env.CLICK_RATE);
     const envVisits = parseInt(process.env.VISITS_PER_DAY, 10);
+    const accountId = parseInt(process.env.MYBID_ACCOUNT_ID, 10);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+        throw new Error('缺少有效的 MYBID_ACCOUNT_ID 环境变量（需为正整数，对应 mybid_account.id）');
+    }
 
     const params = {
-        urlsUrl: URLS_URL,
+        accountId,
         adTimeoutSec: Number.isFinite(envAdTimeout) && envAdTimeout > 0 ? envAdTimeout : AD_TIMEOUT_SEC,
         afterClickSec: Number.isFinite(envAfterClick) && envAfterClick >= 0 ? envAfterClick : AFTER_CLICK_SEC,
         clickProbability: Number.isFinite(envClickRate) && envClickRate >= 0 && envClickRate <= 1 ? envClickRate : CLICK_PROBABILITY,
@@ -99,9 +114,7 @@ function parseArgs() {
     };
 
     for (const arg of args) {
-        if (arg.startsWith('--urls=')) {
-            params.urlsUrl = arg.slice('--urls='.length);
-        } else if (arg.startsWith('--ad-timeout-sec=')) {
+        if (arg.startsWith('--ad-timeout-sec=')) {
             const v = parseFloat(arg.slice('--ad-timeout-sec='.length));
             if (Number.isFinite(v) && v > 0) params.adTimeoutSec = v;
         } else if (arg.startsWith('--after-click-sec=')) {
@@ -123,25 +136,34 @@ function parseArgs() {
 
 // ==================== 数据列表 ====================
 
-async function loadEntries(url) {
-    let raw;
+async function loadEntries(accountId) {
+    let connection;
+    let rawConfig;
     try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
-        if (!res.ok) {
-            throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        connection = await mysql.createConnection(DB);
+        const [rows] = await connection.execute(
+            'SELECT url_config FROM mybid_account WHERE id = ? LIMIT 1',
+            [accountId]
+        );
+        if (rows.length === 0) {
+            throw new Error(`mybid_account 中不存在 id=${accountId} 的记录`);
         }
-        raw = await res.text();
+        rawConfig = rows[0].url_config;
     } catch (e) {
-        throw new Error(`数据列表下载失败 (${url}): ${e.message}`);
+        throw new Error(`读取 mybid_account#${accountId}.url_config 失败: ${e.message}`);
+    } finally {
+        if (connection) await connection.end().catch(() => {});
     }
-    let arr;
-    try {
-        arr = JSON.parse(raw);
-    } catch (e) {
-        throw new Error(`数据列表不是合法 JSON: ${e.message}`);
+    let arr = rawConfig;
+    if (typeof rawConfig === 'string') {
+        try {
+            arr = JSON.parse(rawConfig);
+        } catch (e) {
+            throw new Error(`url_config 不是合法 JSON: ${e.message}`);
+        }
     }
     if (!Array.isArray(arr) || arr.length === 0) {
-        throw new Error('数据列表必须是非空数组');
+        throw new Error('url_config 必须是非空数组');
     }
     return arr.map((item, i) => {
         if (!item || typeof item !== 'object') {
@@ -947,14 +969,14 @@ async function roundRobinLoop(entries, params) {
 
 async function run() {
     const params = parseArgs();
-    const entries = await loadEntries(params.urlsUrl);
+    const entries = await loadEntries(params.accountId);
     headlessFlag = params.headless;
     for (const ad of entries.flatMap((e) => e.ads)) {
         stats.clicksByPos[ad.position] = stats.clicksByPos[ad.position] || 0;
     }
 
     console.log('🚀 启动 CloakBrowser (mBidadm 访问器)...');
-    console.log(`📋 数据列表: ${entries.length} 条 | 来源: ${params.urlsUrl}`);
+    console.log(`📋 数据列表: ${entries.length} 条 | 来源: mybid_account#${params.accountId}.url_config`);
     console.log(`🎯 广告配置: 每页 ${entries.map((e) => e.ads.length).join('/')} 个 | 位置点击率 ` +
         entries.flatMap((e) => e.ads)
             .map((ad) => `${ad.position} ${((ad.clickRate ?? params.clickProbability) * 100).toFixed(0)}%`)
